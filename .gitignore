@@ -40,6 +40,9 @@ replay_pid*
 *.prefs
 /*.prefs
 
+# backup files
+*.bak
+
 # Pycharm files
 *.idea
 *.pyc
