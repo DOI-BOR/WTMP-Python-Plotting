@@ -1,8 +1,10 @@
 # Compiled class file
 *.class
+**/*.class
 
 # Log file
 *.log
+**/*.log
 
 # BlueJ files
 *.ctxt
@@ -42,13 +44,34 @@ replay_pid*
 
 # backup files
 *.bak
+**/*.bak
+**/*.bak.*
 
-# Pycharm files
+# Python files
 *.idea
 *.pyc
 __pycache__/
+
+# duplicated files
+* - Copy*
+**/* - Copy*
+
+# DSS files
+*.dss
+**/*.dss
 
 # pyinstaller files
 dist/
 build/
 *.spec
+
+# compiled Jasper files
+*.jasper
+jasperC/**
+jasperC/
+jasperC/*.jasper
+
+# created by the reporting
+Images/**
+CSVData/**
+Datasources/USBRAutomatedReportOutput.xml
