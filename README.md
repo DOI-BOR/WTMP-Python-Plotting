@@ -14,7 +14,10 @@ All Python dependencies are in the *environment.yml* file. The code is meant to 
 
 ## Usage
 ### Usage withing the build process
-To be added later.
+The Gradle build will download Miniforge, create a local Python environment, and install the dependencies from the
+environment.yml file. It will then run Pyinstaller on the Python sources to create an executable, zip it up,
+and make it available to the rest of the Gradle ecosystem. To perform this action locally, run
+`gradlew assemble`. The zip file will be located in the `build` directory.
 
 ### Post build implementation
 After making any desired changes to the code, a new executable must be compiled and placed in the WAT build.
