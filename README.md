@@ -20,6 +20,6 @@ To be added later.
 After making any desired changes to the code, a new executable must be compiled and placed in the WAT build.
 1. To create a conda environment, in a command prompt type: `conda env create -f environment.yml`
 2. Activate the environment by running the line: `conda activate plotting-env`
-3. Create an executable by running the line: `pyinstaller -y WAT_Report_Generator.py`
+3. Create an executable by running the line: `pyinstaller -y src/main/python/WAT_Report_Generator.py`
 4. In the WAT build *HEC-WAT/AutomatedReport* directory, delete any old files.
 5. From the *dist/WAT_Report_Generator* directory, copy the *_internal* directory and *WAT_Report_Generator.exe* file and paste them into the WAT build */HEC-WAT/AutomatedReport* directory.
