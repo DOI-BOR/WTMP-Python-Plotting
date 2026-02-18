@@ -14,12 +14,15 @@ All Python dependencies are in the *environment.yml* file. The code is meant to 
 
 ## Usage
 ### Usage withing the build process
-To be added later.
+The Gradle build will download Miniforge, create a local Python environment, and install the dependencies from the
+environment.yml file. It will then run Pyinstaller on the Python sources to create an executable, zip it up,
+and make it available to the rest of the Gradle ecosystem. To perform this action locally, run
+`gradlew assemble`. The zip file will be located in the `build` directory.
 
 ### Post build implementation
 After making any desired changes to the code, a new executable must be compiled and placed in the WAT build.
 1. To create a conda environment, in a command prompt type: `conda env create -f environment.yml`
 2. Activate the environment by running the line: `conda activate plotting-env`
-3. Create an executable by running the line: `pyinstaller -y WAT_Report_Generator.py`
+3. Create an executable by running the line: `pyinstaller -y src/main/python/WAT_Report_Generator.py`
 4. In the WAT build *HEC-WAT/AutomatedReport* directory, delete any old files.
 5. From the *dist/WAT_Report_Generator* directory, copy the *_internal* directory and *WAT_Report_Generator.exe* file and paste them into the WAT build */HEC-WAT/AutomatedReport* directory.
