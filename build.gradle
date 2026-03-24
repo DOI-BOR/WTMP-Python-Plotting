@@ -56,7 +56,7 @@ tasks.register("buildInstaller", VenvTask) {
     args = ["-y", "--onefile", "${pythonSourceSet.sourceDirectories.asPath}/WAT_Report_Generator.py"]
     workingDir = pyinstallerDir
 
-    outputs.file(pyinstallerDir.get().dir("dist").dir("WAT_Report_Generator").file("WAT_Report_Generator.exe"))
+    outputs.file(pyinstallerDir.get().dir("dist").file("WAT_Report_Generator.exe"))
 }
 
 tasks.register("zipPython", Zip) {
