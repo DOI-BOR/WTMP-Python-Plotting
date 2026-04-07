@@ -18,7 +18,7 @@ dependencies:
   - matplotlib
   - numpy=1.26.4
   - packaging
-  - pandas
+  - pandas=2.3
   - pillow
   - pyinstaller
   - pyinstaller-hooks-contrib
