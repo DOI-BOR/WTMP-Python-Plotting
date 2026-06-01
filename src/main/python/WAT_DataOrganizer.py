@@ -1448,7 +1448,11 @@ class DataOrganizer(object):
                 data[gateopkey]['gates'] = {}
                 line_data[gateopkey]['gates'] = {}
                 for gate in gateop['gates']:
+                    if self.Report.memberiteration:
+                        gate['members'] = [self.Report.member]
                     dates, values, _ = self.getTimeSeries(gate, makecopy=makecopy)
+                    if isinstance(values, dict) and self.Report.member in values:
+                        values = values[self.Report.member]
                     if 'flag' in gate.keys():
                         flag = gate['flag']
                     else:
