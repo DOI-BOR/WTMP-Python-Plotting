@@ -1,17 +1,3 @@
-"""
-* Copyright 2022 United States Bureau of Reclamation (USBR).
-* United States Department of the Interior
-* All Rights Reserved. USBR PROPRIETARY/CONFIDENTIAL.
-* Source may not be released without written approval
-* from USBR
-
-Created on 7/15/2021
-@author: scott
-@organization: Resource Management Associates
-@contact: scott@rmanet.com
-@note:
-"""
-
 VERSIONNUMBER = '6.0.26'
 
 import os
@@ -46,26 +32,72 @@ import warnings
 # warnings.simplefilter('error') #turn on for debugging warnings
 warnings.filterwarnings("always")
 
+# Round axis limits to "nice" numbers rather than exactly fitting the
+# data, and use the non-interactive Agg backend since reports are
+# generated headlessly (no display needed).
 mpl.rcParams['axes.autolimit_mode'] = 'round_numbers'
 mpl.use("Agg")
 
 
 class MakeAutomatedReport(object):
     """
-    class to organize data and generate XML file for Jasper processing in conjunction with WAT. Takes in a simulation
-    information file output from WAT and develops the report from there.
+    Top-level driver that builds a full WAT report from a simulation info file.
+
+    This class reads the simulation information XML produced by the WAT,
+    organizes the associated model/simulation data (via
+    ``WAT_DataOrganizer``), and walks through every chapter/section/
+    object defined in the study's chapter-definition and graphics-
+    default files to build the report's XML output for Jasper
+    processing. It supports three report types -- ``'validation'``
+    (one report per simulation), ``'comparison'`` (multiple simulations
+    combined into one report), and ``'forecast'`` (ensemble/member-based
+    reporting) -- each with its own control flow in ``__init__``.
     """
 
     def __init__(self, simulationInfoFile, batdir):
         """
-        organizes input data and generates XML report
-        :param simulationInfoFile: full path to simulation information XML file output from WAT.
+        Read the simulation info file and generate the full report.
+
+        Dispatches to one of three control flows based on
+        ``self.reportType`` (set from the simulation info file):
+        ``'validation'``, ``'comparison'``, or ``'forecast'``. Each flow
+        loads the relevant simulation(s)/model alternative(s), builds
+        the report XML chapter by chapter, and writes out the final
+        report XML, CSV data log, and log file.
+
+        Parameters
+        ----------
+        simulationInfoFile : str
+            Full path to the simulation information XML file output
+            from the WAT.
+        batdir : str
+            Path to the batch/install directory (used elsewhere for
+            locating default resources).
+
+        Returns
+        -------
+        None
+            This is a constructor and does not return a value.
+
+        Raises
+        ------
+        SystemExit
+            Raised if the report type is unrecognized, or (indirectly,
+            via various helper calls) if required files/directories
+            are missing.
+
+        Examples
+        --------
+        >>> MakeAutomatedReport('SimulationInfo.xml', '/path/to/batdir')
         """
 
         WF.printVersion(VERSIONNUMBER)
         self.simulationInfoFile = simulationInfoFile
         self.WriteLog = True #TODO we're testing this.
         self.batdir = batdir
+        # Parse the WAT-produced simulation info XML, set up run
+        # directories, load shared constants/defaults, and determine the
+        # report type before branching into type-specific logic below.
         WR.readSimulationInfo(self, simulationInfoFile)  # Read file output by WAT
         self.definePaths()
         self.Constants = WC.WAT_Constants()
@@ -82,7 +114,9 @@ class MakeAutomatedReport(object):
         # chapterkeys.sort() #these are always numbers, so it works
 
         if self.reportType == 'validation':
-
+            # Validation reports: one full report is generated PER
+            # simulation, iterating through that simulation's own
+            # chapter CSV/XML definitions.
             for simulation in self.Simulations:
                 self.reportCSV = WR.readReportCSVFile(self, simulation)
                 # self.modelOrder = 0
@@ -100,6 +134,10 @@ class MakeAutomatedReport(object):
                 self.cleanOutputDirs()
                 self.initializeXML()
                 self.writeXMLIntroduction()
+                # Each chapter key maps to one chapter definition XML;
+                # process them in numeric order, building up the model
+                # alternatives, data organizer, and chapter content for
+                # each in turn.
                 for chapterkey in chapterkeys:
                     WF.print2stdout(f'Running XML file {self.reportCSV[chapterkey]["xmlfile"]}')
                     self.setSimulationCSVVars(self.reportCSV[chapterkey])
@@ -116,6 +154,10 @@ class MakeAutomatedReport(object):
                 self.WAT_log.equalizeLog()
 
         elif self.reportType == 'comparison':
+            # Comparison reports: ALL simulations are loaded up front and
+            # combined into a SINGLE report, using the first simulation's
+            # ID ('base') as the reference for the overall time window
+            # and chapter definitions.
             self.initSimulationDict()
             for simulation in self.Simulations:
                 WF.printSimulationInfo(simulation)
@@ -149,6 +191,10 @@ class MakeAutomatedReport(object):
             self.WAT_log.equalizeLog()
 
         elif self.reportType == 'forecast':
+            # Forecast reports: similar to comparison, but additionally
+            # tracks ensemble members (self.member/self.Ensemble) and
+            # identical-plot-skipping state used when iterating per
+            # member later in writeChapter/writeSections.
             self.initSimulationDict()
             self.organizeMembers()
             self.Ensemble = None
@@ -192,45 +238,99 @@ class MakeAutomatedReport(object):
                 self.WAT_log.equalizeLog()
 
         else:
+            # Unrecognized report type: nothing else in the script knows
+            # how to proceed, so fail fast with a clear error.
             WF.print2stderr('UNKNOWN REPORT TYPE:', self.reportType)
             sys.exit(1)
 
+        # Common finalization for every report type: flush the CSV data
+        # log and the run log to disk.
         self.WAT_log.writeLogFile(self.images_path)
         self.Data.writeDataFiles()
 
     def definePaths(self):
         """
-        defines run specific paths
-        used to contain more paths, but not needed. Consider moving.
-        :return: set class variables
-                    self.images_path
+        Create (if needed) and store the run's Images and CSVData output paths.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        None
+            Sets ``self.images_path`` and ``self.CSVPath``, creating
+            those directories on disk if they don't already exist. Exits
+            the script if either directory can't be created.
+
+        Raises
+        ------
+        SystemExit
+            Raised (via ``sys.exit(1)``) if either output directory
+            cannot be created.
+
+        Examples
+        --------
+        >>> report.definePaths()
         """
 
+        # build and (if needed) create the Images output directory
         self.images_path = os.path.join(self.outputDir, 'Images')
         if not os.path.exists(self.images_path):
             try:
                 os.makedirs(self.images_path)
                 WF.print2stdout(f'{self.images_path} created!')
             except:
+                # couldn't create the required directory, this is a fatal error
                 WF.print2stderr(f'Unable to make {self.images_path}')
                 sys.exit(1)
 
         self.CSVPath = os.path.join(self.outputDir, 'CSVData')  #TODO: update
 
+        # build and (if needed) create the CSVData output directory
         if not os.path.exists(self.CSVPath):
             try:
                 os.makedirs(self.CSVPath)
                 WF.print2stdout(f'{self.CSVPath} created!')
             except:
+                # couldn't create the required directory, this is a fatal error
                 WF.print2stderr(f'Unable to make {self.CSVPath}')
                 sys.exit(1)
 
 
     def makeTimeSeriesPlot(self, object_settings):
         """
-        Takes in object settings to build time series plot and write to XML
-        :param object_settings: currently selected object settings dictionary
-        :return: creates png in images dir and writes to XML file
+        Build a time series plot (one or more stacked axes) and write it to the report.
+
+        Reads the plot's line/gate/reference-line data via the data
+        organizer, draws every configured axis (including optional twin
+        left/right axes, gate "stack" rows, stacked-area plots, and
+        forecast-collection envelopes), formats axis ticks/labels/
+        legends, saves the figure as a PNG, and writes the corresponding
+        half- or full-page plot element into the report XML. Iterates
+        once per configured year (or year block / all-years) and
+        produces one PNG per iteration.
+
+        Parameters
+        ----------
+        object_settings : dict
+            Currently selected time series plot object settings
+            dictionary (parsed from the chapter definition XML).
+
+        Returns
+        -------
+        None
+            Writes one or more PNG files to ``self.images_path`` and
+            appends the corresponding plot element(s) to the report XML.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.makeTimeSeriesPlot(object_settings)
         """
 
         WF.print2stdout('\n################################')
@@ -241,14 +341,22 @@ class MakeAutomatedReport(object):
 
         self.Plots = WPlot.Plots(self)
 
+        # Layer chapter-file settings on top of the graphics defaults
+        # (and an optional named template) before doing anything else,
+        # so every downstream check below can assume settings exist.
         default_settings = self.loadDefaultPlotObject('timeseriesplot') # get default TS plot items
         object_settings = WF.replaceDefaults(self, default_settings, object_settings) # overwrite the defaults with chapter file
 
         if 'template' in object_settings.keys():
+            # an optional named template's settings get layered in below the chapter file's own settings
             template_settings = WR.readTemplate(self, object_settings['template'])
             if object_settings['type'].lower() in template_settings.keys():
                 object_settings = WF.replaceDefaults(self, template_settings[object_settings['type'].lower()], object_settings)
 
+        # Resolve %%flag%% placeholders: symbol/comparison flags
+        # everywhere except the description (which needs Jasper-style
+        # HTML entities instead), then resolve general/model-specific
+        # flags in the title and description text.
         object_settings = WF.replaceflaggedValues(self, object_settings, 'fancytext', exclude=['description'])
         object_settings = WF.replaceflaggedValues(self, object_settings, 'fancytext', include=['description'],
                                                   forjasper=True)
@@ -258,6 +366,8 @@ class MakeAutomatedReport(object):
         object_settings = WF.replaceflaggedValues(self, object_settings, 'modelspecific',
                                                   include=['description', 'title'])
 
+        # Determine which year(s)/year-block(s) this plot should be
+        # generated for, and make sure there's an axis list to iterate.
         object_settings['split_by_year'], object_settings['years'], object_settings['yearstr'] = WF.getObjectYears(self, object_settings)
         object_settings = self.Plots.confirmAxis(object_settings)
 
@@ -265,19 +375,27 @@ class MakeAutomatedReport(object):
 
 
         if 'description' not in object_settings.keys():
+            # no description given, default to empty rather than leaving the key missing
             object_settings['description'] = ''
         # else:
         #     object_settings['description'] = WF.parseForTextFlags(object_settings['description'])
 
+        # ===================== Outer loop: one PNG per year =====================
         for yi, year in enumerate(object_settings['years']):
+            # Deep-copy the settings for this year's iteration so
+            # per-year flag substitutions (below) don't leak into the
+            # next iteration's settings.
             cur_obj_settings = pickle.loads(pickle.dumps(object_settings, -1))
             yearstr = object_settings['yearstr'][yi]
 
             cur_obj_settings = WF.updateFlaggedValues(cur_obj_settings, '%%year%%', yearstr)
             if self.memberiteration:
+                # tag this year's settings with the current forecast member for downstream use
                 cur_obj_settings['member'] = self.member
                 cur_obj_settings['memberiteration'] = self.memberiteration
 
+            # Single-axis plots get a smaller "half page" figure size;
+            # multi-axis (stacked) plots get a taller "full page" size.
             if len(cur_obj_settings['axs']) == 1:
                 figsize = (12, 6)
                 pageformat = 'half'
@@ -285,6 +403,9 @@ class MakeAutomatedReport(object):
                 figsize = (12, 14)
                 pageformat = 'full'
 
+            # Each axis can have a relative height 'weight' (for
+            # gridspec height_ratios); default every axis to equal
+            # weight (1) if not specified.
             axis_weight = []
             for ax_settings in cur_obj_settings['axs']:
                 if 'weight' in ax_settings.keys():
@@ -296,9 +417,11 @@ class MakeAutomatedReport(object):
                 cur_obj_settings['sharex'] == 'false'
 
             if cur_obj_settings['sharex'].lower() == 'true':
+                # shared x-axis across all stacked subplots
                 fig, axes = plt.subplots(nrows=len(cur_obj_settings['axs']), sharex=True, figsize=figsize,
                                          gridspec_kw={'height_ratios': axis_weight})
             else:
+                # each subplot gets its own independent x-axis
                 fig, axes = plt.subplots(ncols=1, nrows=len(cur_obj_settings['axs']), figsize=figsize,
                                          gridspec_kw={'height_ratios': axis_weight})
 
@@ -307,8 +430,11 @@ class MakeAutomatedReport(object):
             useAx = []
             fullyduplicate = False
 
+            # ================= Inner loop: one iteration per stacked axis =================
             for axi, ax_settings in enumerate(cur_obj_settings['axs']):
 
+                # Cascade any plot-level settings down onto this axis
+                # that weren't explicitly overridden at the axis level.
                 ax_settings = WF.copyKeysBetweenDicts(ax_settings, cur_obj_settings, ignore=['axs'])
 
                 if len(cur_obj_settings['axs']) == 1:
@@ -320,6 +446,8 @@ class MakeAutomatedReport(object):
                 self.Plots.setInitialXlims(ax, year)
 
                 ### Make Twin axis ###
+                # twinx = secondary y-axis (right side); twiny = secondary
+                # x-axis (top). Both are optional per-plot settings.
                 _usetwinx = False
                 if 'twinx' in ax_settings.keys():
                     if ax_settings['twinx'].lower() == 'true':
@@ -331,15 +459,21 @@ class MakeAutomatedReport(object):
                         _usetwiny = True
 
                 if _usetwinx:
+                    # create the secondary (right) y-axis sharing the same x-axis
                     ax2 = ax.twinx()
 
                 unitslist = []
                 unitslist2 = []
                 stackplots = {}
 
+                # Pull every line's time series data for this axis in
+                # one call, keyed by (unique) flag.
                 linedata, line_settings = self.Data.getTimeSeriesDataDictionary(ax_settings)
 
                 if self.memberiteration:
+                    # Forecast per-member iteration: substitute the current member's info into the title/description,
+                    # and (if grouping identical members) either skip this plot entirely as a duplicate, or relabel it
+                    # to list every member sharing this identical data.
                     if self.groupmembers:
                         if self.Data.checkForDuplicateObject(line_settings, self.member): #for member iteration plots, skip duplicates. If the first instance of a duplicate plot, plot it but change hte header + description
                             is_lowest = self.Data.checkForLowestMember(line_settings, self.member)
@@ -357,6 +491,10 @@ class MakeAutomatedReport(object):
                                 ax_settings['title'] = WF.updateFlaggedValues(ax_settings['title'], '%%metname%%',
                                                                               WF.matchMemberToEnsembleSet(self.ensembleSets, self.member)['metname'])
                             else:
+                                # Not the lowest member in its duplicate
+                                # group: skip this plot entirely (the
+                                # lowest member's version already covers
+                                # it, with all member numbers listed).
                                 fullyduplicate = True
                                 WF.print2stdout('Duplicate plot found. Skipping plot.')
                                 plt.close('all')
@@ -376,7 +514,8 @@ class MakeAutomatedReport(object):
                             cur_obj_settings['description'] = WF.updateFlaggedValues(cur_obj_settings['description'], '%%metname%%', curr_ensemble_set['metname'])
                             ax_settings['title'] = WF.updateFlaggedValues(ax_settings['title'], '%%metname%%', curr_ensemble_set['metname'])
                     else:
-                        # get the ensemble set for the current member
+                        # Not grouping identical members: always substitute this member's own info, without any
+                        # duplicate-detection/skip logic. Get the ensemble set for the current member.
                         curr_ensemble_set = WF.matchMemberToEnsembleSet(self.ensembleSets, self.member)
 
                         # update the member number
@@ -389,6 +528,9 @@ class MakeAutomatedReport(object):
                         cur_obj_settings['description'] = WF.updateFlaggedValues(cur_obj_settings['description'], '%%metname%%', curr_ensemble_set['metname'])
                         ax_settings['title'] = WF.updateFlaggedValues(ax_settings['title'], '%%metname%%', curr_ensemble_set['metname'])
 
+                # Trim to this year's window, apply value filters (target-elevation, thresholds), scale-by-table
+                # conversions, and merge-line math, then resolve placeholder settings for the base simulation ID and
+                # pull any gate operation data for this axis.
                 linedata = WF.filterDataByYear(linedata, year)
                 linedata = self.Data.filterTimeSeries(linedata, line_settings)
                 linedata = self.Data.scaleValuesByTable(linedata, line_settings)
@@ -403,6 +545,8 @@ class MakeAutomatedReport(object):
                 for gateop in gatedata.keys():
                     gatedata[gateop]['gates'] = WF.filterDataByYear(gatedata[gateop]['gates'], year)
 
+                # A "relative" axis expresses each line as a fraction of the combined total of every line on the axis (e.g. %
+                # of total flow); build that combined master sum once up front, converting it to metric first if needed.
                 if 'relative' in ax_settings.keys():
                     if ax_settings['relative'].lower() == 'true':
                         RelativeMasterSet, RelativeLineSettings = self.Plots.getRelativeMasterSet(linedata, line_settings)
@@ -411,6 +555,7 @@ class MakeAutomatedReport(object):
                                                                                                     RelativeLineSettings['units'],
                                                                                                     ax_settings['unitsystem'])
 
+                # ============ Per-line loop: prepare and draw each line on this axis ============
                 for line in linedata:
                     curline = linedata[line]
                     curline_settings = line_settings[line]
@@ -424,6 +569,8 @@ class MakeAutomatedReport(object):
                     if not curline_settings['collection']:  # please don't do this for collection plots
                         values = WF.ValueSum(dates, values)  # check for dict values and add them all together
 
+                    # Stacked lines are drawn together in a batch after this loop (via curax.stackplot), so flag them here
+                    # rather than plotting them individually below.
                     curline_settings['stack'] = False
                     if 'linetype' in curline_settings.keys():
                         if curline_settings['linetype'].lower() == 'stacked':  # Stacked plots need to be added at the end.
@@ -435,6 +582,8 @@ class MakeAutomatedReport(object):
 
                             curline_settings['stack'] = True
 
+                    # Resolve units: fall back to the parameter's default unit if the line itself didn't report one, then
+                    # resolve a metric/english dict down to a single string, then convert to the axis's requested unit system.
                     if units is None:
                         if parameter is not None:
                             try:
@@ -453,14 +602,17 @@ class MakeAutomatedReport(object):
 
                     chkvals = WF.checkData(values)
                     if not chkvals:
+                        # nothing usable for this line, skip drawing it entirely
                         WF.print2stdout('Invalid Data settings for line:', line, debug=self.debug)
                         continue
 
                     dates = WT.JDateToDatetime(dates, self.startYear)
 
                     if 'elevation_storage_area_file' in curline_settings.keys():
+                        # convert elevation values to storage volume using the configured elevation-storage curve
                         values = WF.calculateStorageFromElevation(values, curline_settings)
 
+                    # Optional manual scalar multiplier; applied per-member for forecast collections, or directly otherwise.
                     if 'scalar' in curline_settings.keys():
                         try:
                             scalar = float(curline_settings['scalar'])
@@ -468,14 +620,18 @@ class MakeAutomatedReport(object):
                                 if isinstance(values, np.ndarray):
                                     values = scalar * values
                                 elif isinstance(values, dict):
+                                    # per-member collection, apply the scalar to each member individually
                                     for member in values.keys():
                                         values[member] = scalar * values[member]
                             else:
                                 values = scalar * values
                         except ValueError:
+                            # invalid scalar value given, skip this line entirely
                             WF.print2stdout('Invalid Scalar. {0}'.format(curline_settings['scalar']), debug=self.debug)
                             continue
 
+                    # Resolve the final line drawing style (colors, width, marker, etc.) from user settings + defaults,
+                    # and assign a distinct color for repeated lines.
                     line_draw_settings = WD.getDefaultLineSettings(self.defaultLineStyles, curline_settings, parameter, i, debug=self.debug)
                     line_draw_settings = WF.fixDuplicateColors(line_draw_settings) #used the line, used param, then double up so subtract 1
 
@@ -487,6 +643,8 @@ class MakeAutomatedReport(object):
                     else:
                         line_draw_settings['label'] = WF.formatTextFlags(line_draw_settings['label'])
 
+                    # Determine which physical axis (left/primary or
+                    # right/twin) this line actually draws onto.
                     curax = ax
                     axis2 = False
                     if _usetwinx:
@@ -504,11 +662,16 @@ class MakeAutomatedReport(object):
                     if 'relative' in ax_settings:
                         if ax_settings['relative'].lower() == 'true':
                             if RelativeLineSettings['interval'] is not None:
+                                # resample this line to the common relative-axis interval before dividing
                                 dates, values = WT.changeTimeSeriesInterval(dates, values, RelativeLineSettings,
                                                                             self.startYear)
+                            # express this line's values as a fraction of the combined master total
                             values = values / RelativeMasterSet
 
                     if isCollection:  #if we have a collection for the datasource
+                        # Forecast ensemble collections have several possible display modes: color each member
+                        # distinctly, plot all members with reduced opacity, plot only the current member during
+                        # member-iteration, or stack the current member.
                         coloreach = False
                         plotallmembers = False
                         if 'coloreach' in curline_settings.keys():
@@ -519,19 +682,28 @@ class MakeAutomatedReport(object):
                                 plotallmembers = True
                         if not coloreach:
                             if not self.memberiteration or plotallmembers:
+                                # Plot every member as a faint (low alpha) line of the same color, unless
+                                # the user set a non-default alpha.
                                 modifiedalpha = False
                                 if line_draw_settings['alpha'] == 1.:
                                     modifiedalpha = True
                                     line_draw_settings['alpha'] = 0.25 #for collection plots, set to low opac for a jillion lines
 
+                                # plot every member as its own faint (or user-set alpha) line
                                 for cIT, member in enumerate(curline_settings['members']):
                                     valueset = values[member]
                                     if cIT > 0:
+                                        # only the first member's plot call carries a legend label
                                         line_draw_settings['label'] = ''
                                     self.Plots.plot(dates, valueset, curax, line_draw_settings)
+
                                 if modifiedalpha:
+                                    # restore full opacity now that all members have been drawn faintly
                                     line_draw_settings['alpha'] = 1.
+
                             elif self.memberiteration:
+                                # Member-iteration mode: draw only the current member's values, either queued
+                                # for the stack-plot batch or drawn immediately.
                                 valueset = values[self.member]
                                 if curline_settings['stack']:
                                     if axis not in stackplots.keys():  # left or right
@@ -544,7 +716,10 @@ class MakeAutomatedReport(object):
                                     self.Plots.plot(dates, valueset, curax, line_draw_settings)
 
                         else:
+                            # coloreach: give every member its own distinct color/label rather than one shared faint color.
                             single_coll_line_settings = self.Plots.seperateCollectionLines(line_draw_settings)
+
+                            # draw each member with its own distinct color/label
                             for member in curline_settings['members']:
                                 valueset = values[member]
                                 coll_line_settings = single_coll_line_settings[member]
@@ -553,14 +728,19 @@ class MakeAutomatedReport(object):
                         self.Plots.plotCollectionEnvelopes(dates, values, curax, line_draw_settings)
 
                     elif curline_settings['stack']:
+                        # Non-collection stacked line: queue it for the
+                        # batch stackplot call after this loop.
                         if axis not in stackplots.keys():  # left or right
                             stackplots[axis] = []
+
                         stackplots[axis].append({'values': values,
                                                  'dates': dates,
                                                  'label': line_draw_settings['label'],
                                                  'color': line_draw_settings['linecolor']})
 
                     else:
+                        # Plain (non-collection, non-stacked) line: draw
+                        # it directly and log a data-provenance entry.
                         self.Plots.plot(dates, values, curax, line_draw_settings)
 
                         self.WAT_log.addLogEntry({'type': line_draw_settings['label'] +
@@ -579,6 +759,8 @@ class MakeAutomatedReport(object):
                                                  isdata=True)
 
                 # GATE DATA #
+                # Gates are drawn as horizontal "stack" rows above the main data (gate_placement tracks the running vertical
+                # offset). gatespacing controls the gap between gate groups.
                 if 'gatespacing' in ax_settings.keys():
                     gatespacing = float(ax_settings['gatespacing'])
                 else:
@@ -590,6 +772,8 @@ class MakeAutomatedReport(object):
                 gateop_rev = list(gatedata.keys())
                 if len(gateop_rev) > 1:
 
+                    # Pre-compute each individual gate's vertical "stack" position, working from the top down (last
+                    # gate group gets the lowest position) so the first gate group in the settings ends up drawn highest.
                     gateline_pos = {}
                     line_pos = gatespacing
                     for gateop in gateop_rev[::-1]:
@@ -599,6 +783,8 @@ class MakeAutomatedReport(object):
                             line_pos += 1
                         line_pos += gatespacing
 
+                    # Draw every gate group's individual gates at their pre-computed stack position, logging a data entry
+                    # per gate.
                     for ggi, gateop in enumerate(gateop_rev):
                         # gate_placement += ggi*gatespacing
                         gate_count = 0  # keep track of gate number in group
@@ -631,6 +817,8 @@ class MakeAutomatedReport(object):
                                 if 'label' not in gate_line_settings.keys():
                                     gate_line_settings['label'] = '{0}_{1}'.format(gateop, gate_count)
 
+                                # Scale the gate's (0/NaN) values by its stack position so it draws as a flat
+                                # line at the correct height when open.
                                 line_placement = gateline_pos[f"{gateop}_{gate}"]
                                 gatelines_positions.append(line_placement)
                                 gatevalues = line_placement * values
@@ -663,6 +851,8 @@ class MakeAutomatedReport(object):
                         gatelabels_positions.append(np.average(gatelines_positions))
                         gate_placement += gatespacing
 
+                # Optional vertical reference lines marking every time a gate's operating status changed (see
+                # WF.getGateOperationTimes), drawn on one or every axis.
                 if 'operationlines' in ax_settings.keys():
                     operationtimes = WF.getGateOperationTimes(gatedata)
                     axs_to_add_line = [ax]
@@ -687,6 +877,8 @@ class MakeAutomatedReport(object):
                                                    zorder=float(opline_settings['zorder']),
                                                    alpha=float(opline_settings['alpha']))
 
+                # Draw every queued stacked-line group (left and/or right axis) as a single matplotlib stackplot call,
+                # after first trimming every stacked series down to only the dates common to ALL of them.
                 for stackplot_ax in stackplots.keys():
                     if stackplot_ax == 'left':
                         curax = ax
@@ -721,6 +913,8 @@ class MakeAutomatedReport(object):
                 ### Horizontal LINES ###
                 self.Plots.plotHorizontalLines(straightlines, ax, cur_obj_settings)
 
+                # Resolve the display unit string(s) for the left/right axes (falling back to the most common unit among the
+                # plotted lines) and substitute them into any %%units%% placeholders in the axis's title/labels.
                 plotunits = WF.getPlotUnits(unitslist, ax_settings)
                 if len(unitslist2) == 0 and 'unitsystem2' in ax_settings.keys():
                     _, plotunits2 = WF.convertUnitSystem([], plotunits, ax_settings['unitsystem2'], debug=self.debug)
@@ -729,6 +923,8 @@ class MakeAutomatedReport(object):
                 ax_settings = WF.updateFlaggedValues(ax_settings, '%%units%%', WF.formatUnitsStrings(plotunits))
                 ax_settings = WF.updateFlaggedValues(ax_settings, '%%units2%%', WF.formatUnitsStrings(plotunits2))
 
+                # Title only needs to be set once (on the first/top axis
+                # of a stacked plot), not repeated on every sub-axis.
                 if axi == 0:
                     if 'title' in ax_settings.keys():
                         if 'titlesize' in ax_settings.keys():
@@ -768,6 +964,9 @@ class MakeAutomatedReport(object):
 
                 ############# xticks and lims #############
 
+                # Apply the configured x-limits; if the plot's window
+                # doesn't overlap the actual data range at all, flag
+                # this axis as unusable (checked after the axis loop).
                 useplot = self.Plots.formatDateXAxis(ax, ax_settings)
                 if not useplot:
                     useAx.append(False)
@@ -788,6 +987,9 @@ class MakeAutomatedReport(object):
                 ax.set_xlim(left=xmin)
                 ax.set_xlim(right=xmax)
 
+                # Optional secondary (top) x-axis: independently
+                # formatted x-limits/ticks, but sharing the same
+                # underlying data range.
                 if _usetwiny:
                     ax2y = ax.twiny()
                     ax2y.set_xlim(left=xmin)
@@ -828,6 +1030,8 @@ class MakeAutomatedReport(object):
                         keepblankax2 = 'false'
                     self.Plots.fixEmptyYAxis(ax, ax2, keepblankax, keepblankax2)
 
+                # If gates were drawn, replace the (meaningless) numeric y-ticks with the gate group labels at their stack
+                # positions instead.
                 if len(gatelabels_positions) > 0:
                     ax.set_yticks(gatelabels_positions)
                     ax.set_yticklabels(gategroup_labels, rotation=90, va='center', ha='center')
@@ -844,6 +1048,8 @@ class MakeAutomatedReport(object):
                         ylabel2 = WF.formatTextFlags(ax_settings['ylabel2'])
                         ax2.set_ylabel(ylabel2, fontsize=ylabsize2)
 
+                    # Right axis ticks either mirror the left axis's ticks (converted to a different unit system), or
+                    # are computed independently.
                     copied_ticks = False
                     if 'sameyticks' in ax_settings:
                         if ax_settings['sameyticks'].lower() == 'true':
@@ -859,6 +1065,8 @@ class MakeAutomatedReport(object):
                     ax.set_zorder(ax2.get_zorder() + 1)  # axis called second will always be on top unless this
                     ax.patch.set_visible(False)
 
+                # Build and place the legend: combine handles/labels from both the left and (if present) right axis, then
+                # position it either to the right of, below, or within the plot per the 'legend_outside' setting.
                 if 'legend' in ax_settings.keys():
                     plt.gcf().canvas.draw()
                     if ax_settings['legend'].lower() == 'true':
@@ -878,6 +1086,8 @@ class MakeAutomatedReport(object):
                                     if ax_settings['useblanklegendentry'].lower() == 'true':
                                         plot_blank = True
                                 if plot_blank:
+                                    # Insert a blank legend entry between the left- and right-axis entries,
+                                    # for visual separation.
                                     empty_handle, = ax.plot([], [], color="w", alpha=0.0)
                                     handles.append(empty_handle)
                                     labels.append('')
@@ -885,6 +1095,8 @@ class MakeAutomatedReport(object):
                             handles += ax2_handles
                             labels += ax2_labels
                             right_sided_axes.append([ax, ax2])
+                            # Compute how far right the legend needs to sit to clear the right y-axis label (if
+                            # any), so it doesn't overlap the axis text.
                             ax2ylabel = ax2.get_ylabel()
                             if ax2ylabel != '':
                                 ax2setylabel = ax2.set_ylabel(ax2ylabel)
@@ -932,6 +1144,8 @@ class MakeAutomatedReport(object):
                                 ax.legend(handles=handles, labels=labels, fontsize=legsize, ncol=numcols)
 
 
+            # If every sub-axis was rejected by the x-limits check above,
+            # skip this year's plot entirely rather than saving a blank figure.
             if not any(useAx):
                 WF.print2stdout(f'Plot for {year} not included due to xlimits.')
 
@@ -949,12 +1163,8 @@ class MakeAutomatedReport(object):
             else:
                 plt.subplots_adjust(wspace=0, hspace=0)
 
-            # if self.memberiteration:
-            #     if fullyduplicate:
-            #         WF.print2stdout(f'Skipping duplicate plot for {year} {self.member}')
-            #         plt.close('all')
-            #         return
-
+            # Build a unique output file name (appending a numeric suffix if the base name is already taken), save the
+            # figure, then write the corresponding half/full-page plot element into the report XML.
             basefigname = os.path.join(self.images_path, 'TimeSeriesPlot' + '_' + self.ChapterRegion.replace(' ', '_')
                                        + '_' + yearstr)
             exists = True
@@ -985,31 +1195,79 @@ class MakeAutomatedReport(object):
 
     def set_identicals_member_key(self, plot_name, member):
         """
-           Update `self.identical_members_key` with the formatted members for the given member in the specified plot.
-           :param plot_name: The name of the plot to use for lookup
-           :param member: The member to get the formatted string for
-           """
+        Set the display key for a member's identical-member group in a plot.
+
+        Parameters
+        ----------
+        plot_name : str
+            Name of the plot to look up.
+        member : str or int
+            Member to get the formatted identical-members string for.
+
+        Returns
+        -------
+        None
+            Sets ``self.identical_members_key``.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.set_identicals_member_key('TempPlot', 5)
+        """
+
         if plot_name in self.plot_identical_members_key:
             member_dict = self.plot_identical_members_key[plot_name]
             if member in member_dict:
+                # found the exact plot/member combination, use its resolved key
                 self.identical_members_key = member_dict[member]
             else:
+                # plot exists but this member wasn't tracked in it
                 self.identical_members_key = f'Member {member} not found in plot {plot_name}'
         else:
+            # plot itself was never tracked at all
             self.identical_members_key = f'Plot name {plot_name} not found in plot_identical_members_key'
 
 
     def check_for_identical_timeSeriesPlots(self, values_dict):
         """
-        Compares members' data within each plot to identify identical and non-identical groups.
+        Compare every member's data within each plot to find identical groups.
 
-        :param values_dict: Dictionary of time series data with plot names as keys.
-        :return: Updates internal variables with results for each plot.
+        Parameters
+        ----------
+        values_dict : dict
+            Dictionary of time series data keyed by plot name; each
+            plot's value is itself a dict of {data_source:
+            {member: values}}.
+
+        Returns
+        -------
+        None
+            Updates ``self.identical_members_per_plot``,
+            ``self.non_identical_members_per_plot``,
+            ``self.complete_identical_members_groups``,
+            ``self.identical_members_do_not_plot``,
+            ``self.plot_identical_members_key``, and
+            ``self.cur_section_members_all_checked`` in place.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.check_for_identical_timeSeriesPlots(values_dict)
         """
 
         plots_processed = 0
 
         for plot_name, plot_data in values_dict.items():
+            # All data sources within a plot share the same member set,
+            # so just grab the keys from the first one.
             member_keys = list(next(iter(plot_data.values())).keys())
             self.identical_groups_per_plot, self.non_identicals_per_plot = [], []
             self.checked_members = set() #reset for each plot
@@ -1017,10 +1275,13 @@ class MakeAutomatedReport(object):
             # Compare each member against others
             for reference_member in member_keys:
                 if reference_member in self.checked_members:
+                    # already grouped as part of an earlier reference member's comparison
                     continue
 
                 identical_to_current = [reference_member]
 
+                # Compare the reference member against every other not-yet-checked member; any exact match gets added to
+                # this reference's identical group.
                 for other_member in member_keys:
                     if other_member == reference_member or other_member in self.checked_members:
                         continue
@@ -1030,9 +1291,11 @@ class MakeAutomatedReport(object):
 
                 # Update identical and non-identical groups
                 if len(identical_to_current) > 1:
+                    # this member has at least one duplicate, record the whole group
                     self.identical_groups_per_plot.append(sorted(identical_to_current))
                     self.checked_members.update(identical_to_current)
                 else:
+                    # this member has no duplicates at all
                     self.non_identicals_per_plot.append(reference_member)
                     self.checked_members.add(reference_member)
 
@@ -1053,13 +1316,35 @@ class MakeAutomatedReport(object):
 
     def are_members_identical(self, plot_data, reference_member, other_member):
         """
-        Compares two members' data across all time series in the plot.
+        Check whether two members' data match exactly across every series.
 
-        :param plot_data: Dictionary of time series data for the plot.
-        :param reference_member: The member to compare against.
-        :param other_member: The member to compare with the reference.
-        :return: True if members are identical, False otherwise.
+        Parameters
+        ----------
+        plot_data : dict
+            Dictionary of time series data for the plot, keyed by data
+            source, each mapping member to its value array.
+        reference_member : str or int
+            The member to compare against.
+        other_member : str or int
+            The member to compare with the reference.
+
+        Returns
+        -------
+        bool
+            ``True`` if every series' values match exactly between the
+            two members, ``False`` if any series differs.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.are_members_identical(plot_data, 1, 2)
+        False
         """
+        # Every data series in the plot must match exactly; a single mismatch means the members are not identical.
         for member_data in plot_data.values():
             if not np.array_equal(member_data[reference_member], member_data[other_member]):
                 return False
@@ -1068,28 +1353,73 @@ class MakeAutomatedReport(object):
 
     def process_plot_results(self, plot_name):
         """
-        Stores results for identical and non-identical members for each plot.
+        Record a plot's identical/non-identical member group results.
 
-        :param plot_name: The name of the plot being processed.
+        Parameters
+        ----------
+        plot_name : str
+            The name of the plot being processed.
+
+        Returns
+        -------
+        None
+            Updates ``self.identical_members_per_plot`` and
+            ``self.non_identical_members_per_plot``, and (if any
+            identical groups were found) updates the identical-members
+            tracking lists/keys via ``create_identical_members_keys``
+            and ``update_identical_members_list``.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.process_plot_results('TempPlot')
         """
         if self.identical_groups_per_plot:
+            # record and propagate any identical-member groups found for this plot
             self.identical_members_per_plot[plot_name] = self.identical_groups_per_plot
             self.create_identical_members_keys(self.identical_groups_per_plot, plot_name)
             self.update_identical_members_list(self.identical_groups_per_plot)
 
         if self.non_identicals_per_plot:
+            # record every member with no duplicate for this plot
             self.non_identical_members_per_plot[plot_name] = self.non_identicals_per_plot
 
 
     def update_identical_members_list(self, identical_groups):
         """
-        Marks identical members and skips plotting for non-primary members.
+        Track identical-member groups and flag non-primary members to skip.
 
-        :param identical_groups: List of groups of identical members.
+        Parameters
+        ----------
+        identical_groups : list of list
+            Groups of identical members (each group a sorted list).
+
+        Returns
+        -------
+        None
+            Updates ``self.complete_identical_members_groups`` and
+            ``self.identical_members_do_not_plot`` in place.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.update_identical_members_list([[1, 2, 3]])
         """
+
         for group in identical_groups:
             if group not in self.complete_identical_members_groups:  # Avoid duplicates
                 self.complete_identical_members_groups.append(group)
+                # Only the first (lowest) member in each group actually
+                # gets plotted; every other member in the group is
+                # flagged to be skipped elsewhere.
                 for member in group:
                     if member != group[0]:
                         self.identical_members_do_not_plot.append(member) # Skip non-primary members
@@ -1097,13 +1427,34 @@ class MakeAutomatedReport(object):
 
     def create_identical_members_keys(self, identical_groups, plot_name):
         """
-        Creates and stores keys for identical members within each plot.
+        Build the display string mapping each plot's identical member groups.
 
-        :param identical_groups: Groups of identical members.
-        :param plot_name: The plot being processed.
-         plot_identical_members_key dict ex: {plot_name: {member1: 'member1, member2'}}
+        Example result shape: ``{plot_name: {member1: 'member1, member2'}}``
+
+        Parameters
+        ----------
+        identical_groups : list of list
+            Groups of identical members.
+        plot_name : str
+            The plot being processed.
+
+        Returns
+        -------
+        None
+            Updates ``self.plot_identical_members_key`` in place.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.create_identical_members_keys([[1, 2]], 'TempPlot')
         """
+
         if plot_name not in self.plot_identical_members_key:
+            # first time seeing this plot at all, initialize its entry
             self.plot_identical_members_key[plot_name] = {}
 
         # Format each group and update the dictionary
@@ -1111,6 +1462,9 @@ class MakeAutomatedReport(object):
             first_member = group[0]
             formatted_members = ', '.join(WF.formatMembers(group))
             if first_member in self.plot_identical_members_key[plot_name]:
+                # A group with this same first_member was already seen
+                # for this plot (e.g. from a different data source);
+                # append rather than overwrite.
                 self.plot_identical_members_key[plot_name][first_member] += f', {formatted_members}'
             else:
                 self.plot_identical_members_key[plot_name][first_member] = formatted_members
@@ -1118,10 +1472,35 @@ class MakeAutomatedReport(object):
 
     def makeProfileStatisticsTable(self, object_settings):
         """
-        Makes a table to compute stats based off of profile lines. Data is interpolated over a series of points
-        determined by the user
-        :param object_settings: currently selected object settings dictionary
-        :return: writes table to XML
+        Build a statistics table computed from vertical profile lines.
+
+        Profile data is interpolated over a series of points (per
+        ``object_settings['resolution']``) so statistics can be computed
+        consistently even when different profile sources sample
+        different depths/elevations. Each requested statistic (mean,
+        min, max, etc.) is computed per profile per timestamp, formatted
+        with any configured thresholds/highlighting, and written as one
+        table row per statistic.
+
+        Parameters
+        ----------
+        object_settings : dict
+            Currently selected profile-statistics-table object settings
+            dictionary.
+
+        Returns
+        -------
+        None
+            Writes the table (or a "no data" warning) to the report XML.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.makeProfileStatisticsTable(object_settings)
         """
 
         WF.print2stdout('\n################################')
@@ -1133,6 +1512,8 @@ class MakeAutomatedReport(object):
         self.Tables = WTable.Tables(self)
         self.Profiles = WProfile.Profiles(self)
 
+        # Layer chapter settings over defaults/template, same pattern as
+        # makeTimeSeriesPlot.
         default_settings = self.loadDefaultPlotObject('profilestatisticstable')
         object_settings = WF.replaceDefaults(self, default_settings, object_settings)
 
@@ -1157,6 +1538,9 @@ class MakeAutomatedReport(object):
         object_settings['warnings'] = self.Profiles.checkProfileValidity(data, object_settings)
 
         line_settings = WF.correctDuplicateLabels(line_settings)
+        # Snapshot settings before ID-specific resolution, since it's
+        # reused later (with %%units%% substitution) as the base
+        # template for building each year's table.
         table_blueprint = pickle.loads(pickle.dumps(object_settings, -1))
 
         object_settings = self.configureSettingsForID(self.base_id, object_settings)
@@ -1178,6 +1562,9 @@ class MakeAutomatedReport(object):
         if 'usedepth' not in object_settings.keys():
             object_settings['usedepth'] = 'true'
 
+        # Convert every profile onto a consistent depth-or-elevation
+        # convention (whichever 'usedepth' requests), using WSE data to
+        # do the conversion where a profile only has the other one.
         if object_settings['usedepth'].lower() == 'false':
             wse_data = self.Data.getProfileWSE(object_settings, onflag='datapaths')
             data = self.Profiles.convertDepthsToElevations(data, wse_data)
@@ -1200,8 +1587,11 @@ class MakeAutomatedReport(object):
         #     object_settings['description'] = WF.parseForTextFlags(object_settings['description'])
 
         if not object_settings['split_by_year']:  #if we don't want to split by year, just make a huge list
+            # Flatten the per-year header groupings into one combined
+            # list, since we're not producing a separate table per year.
             yrheaders = [list(itertools.chain.from_iterable(yrheaders))]
             yrheaders_i = [list(itertools.chain.from_iterable(yrheaders_i))]
+        # ===================== Outer loop: one table per year =====================
         for yi, yrheader_group in enumerate(yrheaders):
             year = object_settings['years'][yi]
             yearstr = object_settings['yearstr'][yi]
@@ -1213,6 +1603,7 @@ class MakeAutomatedReport(object):
 
             object_desc = WF.updateFlaggedValues(object_settings['description'], '%%year%%', yearstr)
 
+            # ============ Inner loop: one column-set per timestamp header ============
             for yhi, yrheader in enumerate(yrheader_group):
                 header_i = yrheaders_i[yi][yhi]
                 headings, rows = self.Tables.buildProfileStatsTable(table_blueprint, yrheader, line_settings)
@@ -1223,6 +1614,11 @@ class MakeAutomatedReport(object):
                         table_constructor[tcnum]['datecolumn'] = yrheader
                     frmt_rows = []
                     threshold_colors = np.full(len(rows), None)
+                    # Each row is a "|"-delimited string
+                    # (rowname|value_for_heading1|value_for_heading2|...);
+                    # extract this heading's value, compute the actual
+                    # statistic if it's still a %%stat%% placeholder, and
+                    # apply threshold coloring/replacement/asterisks.
                     for ri, row in enumerate(rows):
                         s_row = row.split('|')
                         rowname = s_row[0]
@@ -1241,6 +1637,11 @@ class MakeAutomatedReport(object):
                             if not np.isnan(row_val) and row_val is not None:
                                 thresholdsettings = self.Tables.matchThresholdToStat(stat, object_settings)
 
+                                # Apply the first matching threshold rule:
+                                # highlight the cell's color and/or
+                                # substitute a replacement value/asterisk
+                                # when the value crosses the configured
+                                # under/over boundary.
                                 for thresh in thresholdsettings:
                                     if row_val < thresh['value']:
                                         if 'colorwhen' in thresh.keys():
@@ -1289,6 +1690,9 @@ class MakeAutomatedReport(object):
                     table_constructor[tcnum]['thresholdcolors'] = threshold_colors
                     table_constructor[tcnum]['header'] = heading
 
+            # Determine whether each column has any usable (non-missing)
+            # data at all; drop entirely-empty columns from the table,
+            # and skip writing the table entirely if NOTHING has data.
             keeptable = False
             keepall = True
             keepcolumn = {}
@@ -1314,6 +1718,7 @@ class MakeAutomatedReport(object):
 
             if keeptable:  #quick check if we're even writing a table.
                 if not keepall:
+                    # Drop any all-missing columns before writing.
                     new_table_constructor = {}
                     for row_num in table_constructor.keys():
                         constructor = table_constructor[row_num]
@@ -1348,9 +1753,34 @@ class MakeAutomatedReport(object):
 
     def makeProfilePlot(self, object_settings):
         """
-        Takes in object settings to build profile plot and write to XML
-        :param object_settings: currently selected object settings dictionary
-        :return: creates png in images dir and writes to XML file
+        Build a multi-panel vertical profile plot (one panel per timestamp) and write it to the report.
+
+        Each panel shows one or more profile lines (value vs. depth or
+        elevation) at a single timestamp, with optional gate position
+        markers/bands, reference lines, and annotated date/gate-
+        configuration text. Panels are arranged into a grid
+        (``profilesperrow`` x ``rowsperpage``) and split across multiple
+        pages/PNGs as needed, once per configured year.
+
+        Parameters
+        ----------
+        object_settings : dict
+            Currently selected profile plot object settings dictionary.
+
+        Returns
+        -------
+        None
+            Writes one or more PNG files to ``self.images_path`` and
+            appends the corresponding plot elements to the report XML.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.makeProfilePlot(object_settings)
         """
 
         WF.print2stdout('\n################################')
@@ -1396,6 +1826,8 @@ class MakeAutomatedReport(object):
         gatedata, gate_settings = self.Data.getGateDataDictionary(object_settings, makecopy=False)
 
         ################ convert yflags ################
+        # Normalize every profile onto the requested depth-or-elevation
+        # convention using WSE data to convert whichever one is missing.
         if object_settings['usedepth'].lower() == 'false':
             wse_data = self.Data.getProfileWSE(object_settings)
             data = self.Profiles.convertDepthsToElevations(data, wse_data)
@@ -1428,10 +1860,13 @@ class MakeAutomatedReport(object):
         object_settings['warnings'] = self.Profiles.checkProfileValidity(data, object_settings)
 
         ################ Build Plots ################
+        # ===================== Outer loop: one profile-plot block per year =====================
         for yi, year in enumerate(object_settings['years']):
             self.XML.writeProfilePlotStart(obj_desc)
             yearstr = object_settings['yearstr'][yi]
 
+            # Group this year's profile timestamps into pages, each
+            # holding up to (profilesperrow x rowsperpage) panels.
             t_stmps = WT.filterTimestepByYear(object_settings['timestamps'], year)
 
             prof_indices = [np.where(object_settings['timestamps'] == n)[0][0] for n in t_stmps]
@@ -1440,6 +1875,7 @@ class MakeAutomatedReport(object):
             cur_obj_settings = pickle.loads(pickle.dumps(object_settings, -1))
             cur_obj_settings = WF.updateFlaggedValues(cur_obj_settings, '%%year%%', yearstr)  #TODO: reudce the settings
 
+            # ================= Middle loop: one PNG per page =================
             for page_i, pgi in enumerate(page_indices):
 
                 subplot_rows, subplot_cols = WF.getSubplotConfig(len(pgi), int(cur_obj_settings['profilesperrow']))
@@ -1448,6 +1884,7 @@ class MakeAutomatedReport(object):
                 fig, axs = plt.subplots(nrows=int(object_settings['rowsperpage']),
                                         ncols=int(object_settings['profilesperrow']), figsize=(9, 10))
 
+                # ============ Inner loop: one panel per timestamp ============
                 for i in range(n):
 
                     current_row = i // int(object_settings['profilesperrow'])
@@ -1455,14 +1892,19 @@ class MakeAutomatedReport(object):
 
                     ax = axs[current_row, current_col]
                     if i + 1 > len(pgi):
+                        # Fewer profiles than grid cells on this page:
+                        # hide the unused trailing panels.
                         ax.axis('off')
                         continue
                     else:
                         j = pgi[i]
 
                     if object_settings['usedepth'].lower() == 'true':
-                        ax.invert_yaxis()
+                        ax.invert_yaxis() #depth increases downward on the plot
 
+                    # Draw every configured line's profile at this
+                    # timestamp, skipping any line with no/invalid data
+                    # for this particular timestamp.
                     for li, line in enumerate(data.keys()):
                         try:
                             values = data[line]['values'][j]
@@ -1512,6 +1954,8 @@ class MakeAutomatedReport(object):
                     ### VERTICAL LINES ###
                     self.Plots.plotVerticalLines(straightlines, ax, cur_obj_settings, timestamp_index=j, isdate=False)
 
+                    # Axis labels only show on the outer edge panels of
+                    # the grid (per getPlotLabelMasks), to avoid clutter.
                     show_xlabel, show_ylabel = self.getPlotLabelMasks(i, len(pgi), subplot_cols)
 
                     if show_ylabel:
@@ -1540,6 +1984,10 @@ class MakeAutomatedReport(object):
                             xlabel = WF.formatTextFlags(cur_obj_settings['xlabel'])
                             ax.set_xlabel(xlabel, fontsize=xlabsize, labelpad=labelpad)
 
+                    # Only show x/y tick labels on panels that also show
+                    # the corresponding axis label AND have fixed limits
+                    # (otherwise every panel would need its own scale
+                    # shown, defeating the shared-axis grid layout).
                     show_xticks = True
                     if 'xlims' in object_settings.keys() and not show_xlabel:
                         if all([x in object_settings['xlims'].keys() for x in ['min', 'max']]):
@@ -1566,6 +2014,11 @@ class MakeAutomatedReport(object):
                         ax.grid(zorder=-9)
 
                     ### GATES ###
+                    # Draw gate position markers/bands for this
+                    # timestamp: each gate group can define a top/
+                    # bottom/middle elevation band, with individual gate
+                    # positions marked as points spaced evenly across
+                    # the panel's x-range.
                     gateconfig = {}
                     if len(gatedata.keys()) > 0:
                         gatemsk = None
@@ -1592,6 +2045,9 @@ class MakeAutomatedReport(object):
                             elif gatetop is not None and gatebottom is not None:
                                 gatemiddle = np.mean([gatetop, gatebottom])
 
+                            # Fill in whichever of top/bottom/middle
+                            # weren't explicitly given, using the
+                            # configured default gate envelope size.
                             if gatetop is None and gatebottom is not None and gatemiddle is None:  #bottom no top/middle
                                 gatetop = gatebottom + float(object_settings['defaultgateenvelope'])
                                 gatemiddle = gatebottom + float(object_settings['defaultgateenvelope']) / 2
@@ -1602,6 +2058,9 @@ class MakeAutomatedReport(object):
                                 gatebottom = gatemiddle - float(object_settings['defaultgateenvelope']) / 2
                                 gatetop = gatemiddle + float(object_settings['defaultgateenvelope']) / 2
 
+                            # Draw each individual gate's marker (if it
+                            # has a non-NaN value at this timestamp) at
+                            # its pre-computed x-position.
                             for gate in cur_gateop['gates'].keys():
 
                                 curgate = cur_gateop['gates'][gate]
@@ -1660,6 +2119,9 @@ class MakeAutomatedReport(object):
                                      },
                                     isdata=True)
 
+                            # Draw the gate group's top/bottom/middle
+                            # reference lines and (if any gate had a
+                            # value) a shaded band across the envelope.
                             if 'color' in cur_gateop_settings.keys():
                                 color = cur_gateop_settings['color']
                                 default_color = self.Constants.def_colors[ggi]
@@ -1674,6 +2136,9 @@ class MakeAutomatedReport(object):
                             if gateop_has_value:
                                 ax.axhspan(gatebottom, gatetop, alpha=0.5, color=color, zorder=-8)
 
+                    # Build the timestamp display string in the
+                    # requested date format, for the optional
+                    # in-panel date annotation below.
                     cur_timestamp = object_settings['timestamps'][j]
                     if 'dateformat' in object_settings:
                         if object_settings['dateformat'].lower() == 'datetime':
@@ -1691,6 +2156,8 @@ class MakeAutomatedReport(object):
                     else:
                         ttl_str = object_settings['timestamps'][j].strftime('%d %b %Y') #should get set to datetime anyways..
 
+                    # Optional in-panel date label, drawn in the
+                    # top-left corner of the axis.
                     if 'datetext' in cur_obj_settings.keys():
                         if cur_obj_settings['datetext'].lower() == 'true':
                             xbufr = 0.05
@@ -1703,6 +2170,9 @@ class MakeAutomatedReport(object):
                                     bbox=dict(boxstyle='round', facecolor='w', alpha=0.35),
                                     zorder=10)
 
+                    # Optional bottom-of-panel annotation, built from a
+                    # configurable list of items ('date', gate
+                    # configuration/blend day counts, or literal text).
                     if 'bottomtext' in cur_obj_settings.keys():
                         bottomtext_str = []
                         for text in cur_obj_settings['bottomtext']:
@@ -1740,6 +2210,9 @@ class MakeAutomatedReport(object):
 
                 plt.tight_layout()
 
+                # Combine legend entries from every panel on the page
+                # (de-duplicated by label) into a single shared legend
+                # positioned below the grid.
                 if 'legend' in cur_obj_settings.keys():
                     if cur_obj_settings['legend'].lower() == 'true':
                         leg_labels = []
@@ -1762,6 +2235,10 @@ class MakeAutomatedReport(object):
 
                             ncolumns = 3
 
+                            # Reserve vertical space at the bottom of the
+                            # figure proportional to how many legend rows
+                            # will be needed, then position the legend
+                            # within that reserved space.
                             # n_legends_row = np.ceil(len(linedata.keys()) / ncolumns) * .65
                             n_legends_row = np.ceil(len(leg_handles) / ncolumns) * .65
                             if n_legends_row < 1:
@@ -1777,6 +2254,10 @@ class MakeAutomatedReport(object):
                                        labels=leg_labels)
 
 
+                # Build a unique output file name (appending a numeric
+                # suffix if the base name is already taken), save the
+                # figure, then write it into the report XML with a
+                # "page X of Y" style description.
                 basefigname = 'ProfilePlot_{0}_{1}_{2}_{3}_{4}'.format(self.ChapterName, yearstr,
                                                                        object_settings['plot_parameter'], self.program,
                                                                        page_i)
@@ -1838,9 +2319,34 @@ class MakeAutomatedReport(object):
 
     def makeErrorStatisticsTable(self, object_settings):
         """
-        Takes in object settings to build error stats table and write to XML
-        :param object_settings: currently selected object settings dictionary
-        :return: writes to XML file
+        Build a statistics table comparing computed data against observed/reference data.
+
+        Computes one or more statistics (RMSE, MAE, bias, NSE, etc., as
+        configured) per data source per year, applies optional threshold
+        coloring/replacement, and writes the resulting table (or a
+        "no data" warning) to the report XML. Handles forecast
+        collection data (per-member rows) and member-iteration duplicate
+        skipping the same way as ``makeTimeSeriesPlot``.
+
+        Parameters
+        ----------
+        object_settings : dict
+            Currently selected error-statistics-table object settings
+            dictionary.
+
+        Returns
+        -------
+        None
+            Writes the table (or a "no data" warning) to the report XML.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.makeErrorStatisticsTable(object_settings)
         """
 
         WF.print2stdout('\n################################')
@@ -1872,6 +2378,10 @@ class MakeAutomatedReport(object):
 
         data, data_settings = self.Data.getTableDataDictionary(object_settings)
 
+        # Same member-iteration duplicate-skip/relabel logic as
+        # makeTimeSeriesPlot: substitute this member's info into the
+        # description, or skip the table entirely (or relabel it to
+        # list all members sharing identical data).
         fullyduplicate = False
         if self.memberiteration:
             if self.groupmembers:
@@ -1921,6 +2431,8 @@ class MakeAutomatedReport(object):
 
         object_settings = self.Tables.replaceComparisonSettings(object_settings, self.iscomp)
 
+        # Build the table's row/column templates (still containing
+        # %%stat%%-style placeholders to be resolved per-year below).
         headings, rows = self.Tables.buildErrorStatsTable(object_settings, data_settings)
         headings = self.Tables.replaceIllegalJasperCharactersHeadings(headings)
         rows = self.Tables.replaceIllegalJasperCharactersRows(rows)
@@ -1941,6 +2453,8 @@ class MakeAutomatedReport(object):
         else:
             primarykeyheader = 'Year'
 
+        # Forecast collections get one row expanded per member rather
+        # than a single aggregate row.
         isCollection = WF.checkForCollections(data_settings)
         if isCollection:
             members = self.Data.getMembers(object_settings, data_settings)
@@ -1966,9 +2480,11 @@ class MakeAutomatedReport(object):
 
         table_constructor = {}
 
+        # ===================== Outer loop: one column-set per year =====================
         for yi, year in enumerate(object_settings['years']):  #iterate years. If iscomp, that;s the date header.
             yearlydata = self.Tables.filterTableData(data, object_settings)
             yearheader = object_settings['yearstr'][yi]
+            # ============ Inner loop: one row-set per heading (statistic) ============
             for hi, header in enumerate(headings):
                 tcnum = len(table_constructor.keys())
                 table_constructor[tcnum] = {}
@@ -1978,6 +2494,9 @@ class MakeAutomatedReport(object):
                 header_frmt = header.replace('%%year%%', yearheader)
                 frmt_rows = []
                 threshold_colors = np.full(len(rows), None)
+                # Compute this heading/year's value for every row,
+                # resolving the row's %%stat%% placeholder if present
+                # and applying threshold coloring/replacement.
                 for ri, row in enumerate(rows):
                     s_row = row.split('|')
                     rowname = s_row[0]
@@ -1990,6 +2509,9 @@ class MakeAutomatedReport(object):
                         member = None
                     if '%%' in rowname:
                         if isCollection and '%%member' in rowname:
+                            # Row itself specifies a member (expanded by
+                            # configureRowsForCollection above); resolve
+                            # its display name.
                             member = int(rowname.split('%%member.')[1].split('%%')[0])
                             curr_ensemble_set = WF.matchMemberToEnsembleSet(self.ensembleSets, member)
                             rowname = WF.updateFlaggedValues(rowname, f'%%member.{member}%%', WF.getOriginalMemberNumber(member, curr_ensemble_set, self.DSSFile,
@@ -2008,6 +2530,9 @@ class MakeAutomatedReport(object):
                             else:
                                 row_val, stat = self.Tables.getStatsLine(row_val, rowdata)
                             if not np.isnan(row_val) and row_val is not None:
+                                # Apply the first matching threshold
+                                # rule's color/replacement/asterisk, same
+                                # pattern as makeProfileStatisticsTable.
                                 thresholdsettings = self.Tables.matchThresholdToStat(stat, object_settings)
                                 for thresh in thresholdsettings:
                                     if row_val < thresh['value']:
@@ -2067,6 +2592,9 @@ class MakeAutomatedReport(object):
                 table_constructor[tcnum]['thresholdcolors'] = threshold_colors
                 table_constructor[tcnum]['header'] = header_frmt
 
+        # Determine whether each column has any usable (non-missing)
+        # data at all; drop entirely-empty columns, and skip writing the
+        # table entirely if nothing has any data.
         keeptable = False
         keepall = True
         keepcolumn = {}
@@ -2119,9 +2647,32 @@ class MakeAutomatedReport(object):
 
     def makeMonthlyStatisticsTable(self, object_settings):
         """
-        Takes in object settings to build monthly stats table and write to XML
-        :param object_settings: currently selected object settings dictionary
-        :return: writes to XML file
+        Build a statistics table broken out by calendar month.
+
+        Follows the same general pattern as ``makeErrorStatisticsTable``
+        (resolve %%stat%% placeholders per row/column, apply threshold
+        coloring, drop all-missing columns) but groups data by month
+        rather than by data source/member.
+
+        Parameters
+        ----------
+        object_settings : dict
+            Currently selected monthly-statistics-table object settings
+            dictionary.
+
+        Returns
+        -------
+        None
+            Writes the table (or a "no data" warning) to the report XML.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.makeMonthlyStatisticsTable(object_settings)
         """
 
         WF.print2stdout('\n################################')
@@ -2151,6 +2702,8 @@ class MakeAutomatedReport(object):
 
         object_settings = self.Tables.replaceComparisonSettings(object_settings, self.iscomp)
 
+        # Build the month-by-month row/column templates (still
+        # containing %%stat%%-style placeholders resolved below).
         headings, rows = self.Tables.buildMonthlyStatsTable(object_settings, data_settings)
 
         object_settings = self.configureSettingsForID(self.base_id, object_settings)
@@ -2172,9 +2725,11 @@ class MakeAutomatedReport(object):
 
         table_constructor = {}
 
+        # ===================== Outer loop: one column-set per year =====================
         for yi, year in enumerate(object_settings['years']):  # Iterate years. If iscomp, that's the date header.
 
             yearheader = object_settings['yearstr'][yi]
+            # ============ Inner loop: one row-set per heading (month/statistic) ============
             for hi, header in enumerate(headings):
                 tcnum = len(table_constructor.keys())
                 table_constructor[tcnum] = {}
@@ -2185,6 +2740,9 @@ class MakeAutomatedReport(object):
 
                 frmt_rows = []
                 threshold_colors = np.full(len(rows), None)
+                # Resolve each row's %%stat%% placeholder and apply
+                # threshold coloring/replacement, same pattern as
+                # makeErrorStatisticsTable.
                 for ri, row in enumerate(rows):
                     s_row = row.split('|')
                     rowname = s_row[0]
@@ -2263,6 +2821,8 @@ class MakeAutomatedReport(object):
                 table_constructor[tcnum]['thresholdcolors'] = threshold_colors
                 table_constructor[tcnum]['header'] = header_frmt
 
+        # Drop all-missing columns; skip the table entirely if nothing
+        # has any data at all.
         keeptable = False
         keepall = True
         keepcolumn = {}
@@ -2314,9 +2874,33 @@ class MakeAutomatedReport(object):
 
     def makeSingleStatisticTable(self, object_settings):
         """
-        takes in object settings to build Single Statistic table and write to XML
-        :param object_settings: currently selected object settings dictionary
-        :return: creates png in images dir and writes to XML file
+        Build a table of one statistic per year (rows) x data source (columns).
+
+        Unlike ``makeErrorStatisticsTable``/``makeMonthlyStatisticsTable``
+        (which put statistics in rows and years in columns), this table
+        is transposed: years (or "All") are rows, data-source headings
+        are columns, with an optional month grouping for comparison
+        reports.
+
+        Parameters
+        ----------
+        object_settings : dict
+            Currently selected single-statistic-table object settings
+            dictionary.
+
+        Returns
+        -------
+        None
+            Writes the table (or a "no data" warning) to the report XML.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.makeSingleStatisticTable(object_settings)
         """
 
         WF.print2stdout('\n################################')
@@ -2354,6 +2938,9 @@ class MakeAutomatedReport(object):
 
         thresholds = self.Tables.getThresholdsfromSettings(object_settings)
 
+        # Snapshot settings before ID-specific resolution; reused below
+        # (as object_settings_blueprint) for date/unit lookups that need
+        # the pre-resolution settings shape.
         object_settings_blueprint = pickle.loads(pickle.dumps(object_settings, -1))
 
         headings, rows = self.Tables.buildSingleStatTable(object_settings_blueprint, data_settings)
@@ -2368,15 +2955,20 @@ class MakeAutomatedReport(object):
 
         table_constructor = {}
 
+        # Comparison reports break the table out by month (3-letter
+        # codes); non-comparison reports use a single unlabeled "column
+        # group" since months are already baked into the headings.
         if self.iscomp:
             datecolumns = self.Constants.mo_str_3
         else:
             datecolumns = ['']  # if not comp run, we don't need date headings, months will be in headings
 
+        # ===================== Outer loop: one column-set per month (or single pass) =====================
         for mi, month in enumerate(datecolumns):
             if len(headings) == 0:
                 WF.print2stdout('No headings for table.', debug=self.debug)
                 # self.XML.writeDateColumn(month)
+            # ============ Inner loop: one column-set per heading (data source) ============
             for i, header in enumerate(headings):
                 tcnum = len(table_constructor.keys())
                 table_constructor[tcnum] = {}
@@ -2384,6 +2976,10 @@ class MakeAutomatedReport(object):
                     table_constructor[tcnum]['datecolumn'] = month
                 frmt_rows = []
                 threshold_colors = np.full(len(rows), None)
+                # Each row here corresponds to one YEAR (rather than one
+                # statistic, as in the other table types); resolve this
+                # row/heading/month's %%stat%% placeholder and apply
+                # threshold coloring.
                 for ri, row in enumerate(rows):
                     s_row = row.split('|')
                     rowname = s_row[0]
@@ -2466,6 +3062,11 @@ class MakeAutomatedReport(object):
                 table_constructor[tcnum]['header'] = header
 
         # Check for entire rows/columns that can be sniped
+        # Note: unlike the other table types, missing-data pruning here
+        # operates on ROW NAMES (keepheader, keyed by rowname) rather
+        # than column headers, since a "row" here represents a
+        # year/data-key that may be entirely missing across every
+        # heading/month.
         keeptable = False
         keepall = True
         keepheader = {}
@@ -2490,6 +3091,9 @@ class MakeAutomatedReport(object):
 
         if keeptable:  #quick check if we're even writing a table.
             if not keepall:
+                # Drop only the specific rows that are all-missing,
+                # keeping the threshold-color list aligned with the
+                # filtered rows.
                 for row_num in table_constructor.keys():
                     constructor = table_constructor[row_num]
                     rows = constructor['rows']
@@ -2520,9 +3124,34 @@ class MakeAutomatedReport(object):
 
     def makeSingleStatisticProfileTable(self, object_settings):
         """
-        takes in object settings to build Single Statistic profile table and write to XML
-        :param object_settings: currently selected object settings dictionary
-        :return: creates png in images dir and writes to XML file
+        Build a year x data-source single-statistic table computed from profile data.
+
+        Same transposed row/column layout as ``makeSingleStatisticTable``
+        (years/rows x data-sources/columns, with an optional per-month
+        breakout for comparison reports), but the underlying statistic
+        is computed from interpolated vertical profile data (combining
+        every profile timestamp within the row's year/month) rather than
+        a plain time series.
+
+        Parameters
+        ----------
+        object_settings : dict
+            Currently selected single-statistic-profile-table object
+            settings dictionary.
+
+        Returns
+        -------
+        None
+            Writes the table (or a "no data" warning) to the report XML.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.makeSingleStatisticProfileTable(object_settings)
         """
 
         WF.print2stdout('\n################################')
@@ -2549,6 +3178,9 @@ class MakeAutomatedReport(object):
         ################# Get timestamps #################
         object_settings['datessource_flag'] = WF.getDateSourceFlag(object_settings)
         object_settings['timestamps'] = self.Profiles.getProfileTimestamps(object_settings, self.StartTime, self.EndTime)
+        # Pre-index every profile timestamp by [year][month] so the
+        # table-building loop below can quickly grab "every timestamp in
+        # year X month Y" without re-scanning the full timestamp list.
         object_settings['timestamp_index'] = self.Profiles.getProfileTimestampYearMonthIndex(object_settings, self.years)
 
         object_settings['split_by_year'], object_settings['years'], object_settings['yearstr'] = WF.getObjectYears(self, object_settings)
@@ -2574,6 +3206,8 @@ class MakeAutomatedReport(object):
         if 'usedepth' not in object_settings.keys():
             object_settings['usedepth'] = 'true'
 
+        # Normalize every profile onto the requested depth-or-elevation
+        # convention using WSE data to convert whichever one is missing.
         if object_settings['usedepth'].lower() == 'false':
             wse_data = self.Data.getProfileWSE(object_settings, onflag='datapaths')
             data = self.Profiles.convertDepthsToElevations(data, wse_data)
@@ -2587,6 +3221,8 @@ class MakeAutomatedReport(object):
 
         thresholds = self.Tables.getThresholdsfromSettings(object_settings)
 
+        # Snapshot pre-ID-resolution settings for later date/index
+        # lookups, same pattern as makeSingleStatisticTable.
         object_settings_blueprint = pickle.loads(pickle.dumps(object_settings, -1))
 
         headings, rows = self.Tables.buildSingleStatTable(object_settings_blueprint, line_settings)
@@ -2606,9 +3242,11 @@ class MakeAutomatedReport(object):
         else:
             datecolumns = ['']  # If not comp run we don't need date headings, months will be in headings
 
+        # ===================== Outer loop: one column-set per month (or single pass) =====================
         for mi, month in enumerate(datecolumns):
             if len(headings) == 0:
                 WF.print2stdout('No headings for table.', debug=self.debug)
+            # ============ Inner loop: one column-set per heading (data source) ============
             for i, header in enumerate(headings):
                 tcnum = len(table_constructor.keys())
                 table_constructor[tcnum] = {}
@@ -2616,6 +3254,9 @@ class MakeAutomatedReport(object):
                     table_constructor[tcnum]['datecolumn'] = month
                 frmt_rows = []
                 threshold_colors = np.full(len(rows), None)
+                # Each row here corresponds to one YEAR; resolve this
+                # row/heading/month's statistic by combining EVERY
+                # profile timestamp falling in that year/month.
                 for ri, row in enumerate(rows):
                     s_row = row.split('|')
                     rowname = s_row[0]
@@ -2627,6 +3268,10 @@ class MakeAutomatedReport(object):
                     addasterisk = False
                     if '%%' in row_val:
                         rowval_stats = {}
+                        # Resolve which set of pre-indexed timestamp
+                        # indices to combine: every month for
+                        # ALLYEARS rows, or just this row's specific
+                        # year+month/heading combination otherwise.
                         if year == 'ALLYEARS':
                             if self.iscomp:
                                 data_idx = WF.getAllMonthIdx(object_settings_blueprint['timestamp_index'], mi)
@@ -2637,6 +3282,10 @@ class MakeAutomatedReport(object):
                                 data_idx = object_settings_blueprint['timestamp_index'][ri][mi]
                             else:
                                 data_idx = object_settings_blueprint['timestamp_index'][ri][i]
+                        # Stack every matched timestamp's profile data
+                        # together before computing the statistic, so the
+                        # stat reflects the combined distribution across
+                        # all matched profiles.
                         for di in data_idx:
                             stats_data = self.Tables.formatStatsProfileLineData(row_val, data,
                                                                                 object_settings_blueprint['resolution'],
@@ -2706,6 +3355,9 @@ class MakeAutomatedReport(object):
                 table_constructor[tcnum]['thresholdcolors'] = threshold_colors
                 table_constructor[tcnum]['header'] = header
 
+        # Drop all-missing rows (keyed by rowname, same approach as
+        # makeSingleStatisticTable); skip the table entirely if nothing
+        # has any data at all.
         keeptable = False
         keepall = True
         keepheader = {}
@@ -2769,9 +3421,33 @@ class MakeAutomatedReport(object):
 
     def makeContourPlot(self, object_settings):
         """
-        Takes in object settings to build contour plot and write to XML
-        :param object_settings: currently selected object settings dictionary
-        :return: creates png in images dir and writes to XML file
+        Build a longitudinal contour plot (value vs. distance vs. time) and write it to the report.
+
+        Draws one filled contour panel per simulation ID (stacked
+        vertically for comparison reports), with optional labeled
+        contour lines, transition markers, and a shared horizontal
+        colorbar. Iterates once per configured year and produces one PNG
+        per iteration.
+
+        Parameters
+        ----------
+        object_settings : dict
+            Currently selected contour plot object settings dictionary.
+
+        Returns
+        -------
+        None
+            Writes one or more PNG files to ``self.images_path`` and
+            appends the corresponding plot elements to the report XML.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.makeContourPlot(object_settings)
         """
 
         WF.print2stdout('\n################################')
@@ -2803,6 +3479,7 @@ class MakeAutomatedReport(object):
         # else:
         #     object_settings['description'] = WF.parseForTextFlags(object_settings['description'])
 
+        # ===================== Outer loop: one PNG per year =====================
         for yi, year in enumerate(object_settings['years']):
             useAx = []
             cur_obj_settings = pickle.loads(pickle.dumps(object_settings, -1))
@@ -2821,12 +3498,18 @@ class MakeAutomatedReport(object):
             # [01jan2016, 04Feb2016, 23May2016] #dates
             # [0, 19, 25, 35] #distances
 
+            # Pull every reach's contour data across every simulation
+            # ID, trim to this year, and determine which IDs actually
+            # have data to plot (one panel per ID).
             contoursbyID, contoursbyID_settings = self.Data.getContourDataDictionary(cur_obj_settings)
             contoursbyID = WF.filterDataByYear(contoursbyID, year)
             selectedContourIDs = WF.getUsedIDs(contoursbyID_settings)
 
             straightlines = self.Data.getStraightLineValue(cur_obj_settings)
 
+            # Single-ID plots get a smaller "half page" figure;
+            # multi-ID (comparison) plots get a taller "full page" figure
+            # with one stacked panel per ID.
             if len(selectedContourIDs) == 1:
                 figsize = (12, 6)
                 pageformat = 'half'
@@ -2835,6 +3518,9 @@ class MakeAutomatedReport(object):
                 pageformat = 'full'
 
             if pageformat == 'full':
+                # Give every panel except the last one a slightly smaller
+                # height ratio, since the last panel also carries the
+                # shared x-axis tick labels.
                 height_ratios = []
                 for i in range(len(selectedContourIDs)):
                     if i == len(selectedContourIDs) - 1:
@@ -2847,17 +3533,24 @@ class MakeAutomatedReport(object):
                 fig, axes = plt.subplots(ncols=1, nrows=1, figsize=figsize,
                                          )
 
+            # ================= Inner loop: one panel per simulation ID =================
             for IDi, ID in enumerate(selectedContourIDs):
                 contour_plot_settings = pickle.loads(pickle.dumps(cur_obj_settings, -1))
                 contour_plot_settings = self.configureSettingsForID(ID, contour_plot_settings)
                 contours = WF.selectContourByID(contoursbyID, ID)
                 contour_settings = WF.selectContourByID(contoursbyID_settings, ID)
+                # Stack every reach belonging to this ID into one
+                # combined values/dates/distance array, tracking where
+                # each reach's data begins (transitions).
                 values, dates, distance, transitions = WF.stackContours(contours, contoursbyID_settings)
                 if len(selectedContourIDs) == 1:
                     axes = [axes]
 
                 ax = axes[IDi]
 
+                # Determine the dominant parameter among this ID's
+                # reaches, used to look up default units if none were
+                # explicitly configured.
                 for contourname in contour_settings:
                     c_set = contour_settings[contourname]
                     parameter, contour_plot_settings['param_count'] = WF.getParameterCount(c_set, contour_plot_settings)
@@ -2868,6 +3561,8 @@ class MakeAutomatedReport(object):
                     if 'parameter' in contour_plot_settings.keys():
                         parameter = contour_plot_settings['parameter']
                     else:
+                        # Pick whichever parameter was used most often
+                        # across this ID's reaches.
                         parameter = ''
                         top_count = 0
                         for key in contour_plot_settings['param_count'].keys():
@@ -2906,6 +3601,8 @@ class MakeAutomatedReport(object):
 
                 contour_plot_settings = WD.getDefaultContourSettings(contour_plot_settings, debug=self.debug)
 
+                # Resolve the colorbar value range, defaulting to the
+                # actual data min/max if not explicitly configured.
                 if 'min' in contour_plot_settings['colorbar']:
                     vmin = float(contour_plot_settings['colorbar']['min'])
                 else:
@@ -2915,6 +3612,7 @@ class MakeAutomatedReport(object):
                 else:
                     vmax = np.nanmax(values)
 
+                # Draw the filled contour (the main plot content).
                 contr = ax.contourf(dates, distance, values, cmap=contour_plot_settings['colorbar']['colormap'],
                                     vmin=vmin, vmax=vmax,
                                     levels=np.linspace(vmin, vmax, int(contour_plot_settings['colorbar']['bins'])), #add one to get the desired number..
@@ -2937,6 +3635,9 @@ class MakeAutomatedReport(object):
 
                 contour_plot_settings = WF.updateFlaggedValues(contour_plot_settings, '%%units%%', WF.formatUnitsStrings(units))
 
+                # Draw any configured overlay contour lines (e.g. a
+                # single labeled isotherm), each with its own optional
+                # inline label and legend entry.
                 if 'contourlines' in contour_plot_settings.keys():
                     for contourline in contour_plot_settings['contourlines']:
                         if 'value' in contourline.keys():
@@ -2967,6 +3668,9 @@ class MakeAutomatedReport(object):
                 ### Horizontal LINES ###
                 self.Plots.plotHorizontalLines(straightlines, ax, contour_plot_settings)
 
+                # For comparison reports, label each panel with which
+                # simulation it represents (since panels are stacked
+                # vertically without individual titles).
                 if self.iscomp:
                     if 'modeltext' in contour_plot_settings.keys():
                         modeltext = contour_plot_settings['modeltext']
@@ -3004,12 +3708,17 @@ class MakeAutomatedReport(object):
 
                 self.Plots.formatYTicks(ax, contour_plot_settings)
 
+                # Mark and (optionally) label the distances at which one
+                # reach's data transitions into the next (from
+                # WF.stackContours), e.g. reservoir-to-river boundaries.
                 if 'transitions' in contour_plot_settings.keys():
                     for transkey in transitions.keys():
                         transition_start = transitions[transkey]
                         trans_name = None
                         hline = WD.getDefaultStraightLineSettings(contour_plot_settings['transitions'], self.debug)
 
+                        # Prefer per-reach transition style settings over
+                        # the generic 'transitions' defaults.
                         linecolor = WF.prioritizeKey(contours[transkey], hline, 'linecolor')
                         linestylepattern = WF.prioritizeKey(contours[transkey], hline, 'linestylepattern')
                         alpha = WF.prioritizeKey(contours[transkey], hline, 'alpha')
@@ -3024,6 +3733,9 @@ class MakeAutomatedReport(object):
                             if trans_flag in contour_settings[transkey].keys():
                                 trans_name = contour_settings[transkey][trans_flag]
                             if trans_name is not None:
+                                # Only draw the label if the transition
+                                # line actually falls within the visible
+                                # y-range of this panel.
                                 if ax.get_ylim()[0] <= transition_start <= ax.get_ylim()[1]:
                                     trans_y_value = transition_start + ((ax.get_ylim()[1] - ax.get_ylim()[0]) * .01)
 
@@ -3037,7 +3749,7 @@ class MakeAutomatedReport(object):
                                             horizontalalignment=horizontalalignment,
                                             verticalalignment='top')
 
-                ax.invert_yaxis()
+                ax.invert_yaxis() #distance increases downstream, but is plotted from the source at the top
 
             # #stuff to call once per plot
             self.configureSettingsForID(self.base_id, cur_obj_settings)
@@ -3081,10 +3793,14 @@ class MakeAutomatedReport(object):
                         plt.legend(fontsize=legsize)
 
             if not any(useAx):
+                # x-limits rejected every panel: skip this year's plot
+                # entirely rather than saving a blank figure.
                 print(f'Plot for {year} not included due to xlimits.')
                 plt.close("all")
                 continue
 
+            # Shared horizontal colorbar spanning the bottom of the
+            # figure, ticked at the configured number of intervals.
             cbar = plt.colorbar(contr, ax=axes[-1], orientation='horizontal', aspect=50.)
             locs = np.linspace(vmin, vmax, int(contour_plot_settings['colorbar']['numticks']))
             cbar.set_ticks(locs)
@@ -3107,6 +3823,9 @@ class MakeAutomatedReport(object):
             # else:
             #     cur_obj_settings['description'] = WF.parseForTextFlags(cur_obj_settings['description'])
 
+            # Build a unique output file name (appending a numeric
+            # suffix if the base name is already taken), save the
+            # figure, then write it into the report XML.
             basefigname = os.path.join(self.images_path, 'ContourPlot' + '_' + self.ChapterRegion.replace(' ', '_')
                                        + '_' + yearstr)
             exists = True
@@ -3135,9 +3854,34 @@ class MakeAutomatedReport(object):
 
     def makeReservoirContourPlot(self, object_settings):
         """
-        Takes in object settings to build reservoir contour plot and write to XML
-        :param object_settings: currently selected object settings dictionary
-        :return: creates png in images dir and writes to XML file
+        Build a reservoir vertical-contour plot (value vs. elevation vs. time) and write it to the report.
+
+        Similar to ``makeContourPlot``, but plots a single reservoir's
+        value distribution against elevation (rather than longitudinal
+        distance) over time, trimming out any values above the actual
+        water surface elevation at each timestep (ResSim otherwise
+        repeats the top-of-domain value up past the real water surface).
+
+        Parameters
+        ----------
+        object_settings : dict
+            Currently selected reservoir contour plot object settings
+            dictionary.
+
+        Returns
+        -------
+        None
+            Writes one or more PNG files to ``self.images_path`` and
+            appends the corresponding plot elements to the report XML.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.makeReservoirContourPlot(object_settings)
         """
 
         WF.print2stdout('\n################################')
@@ -3171,6 +3915,7 @@ class MakeAutomatedReport(object):
         # else:
         #     object_settings['description'] = WF.parseForTextFlags(object_settings['description'])
 
+        # ===================== Outer loop: one PNG per year =====================
         for yi, year in enumerate(object_settings['years']):
             useAx = []
             cur_obj_settings = pickle.loads(pickle.dumps(object_settings, -1))
@@ -3189,11 +3934,18 @@ class MakeAutomatedReport(object):
             # [0, 19, 25, 35] #elevations
             # [0, 19, 25, 35] #top water elevations
 
+            # Pull every reservoir's data across every simulation ID
+            # (trimmed to this year, keeping the parallel 'topwater'
+            # array in sync), and determine which IDs actually have data
+            # to plot (one panel per ID).
             contoursbyID, contoursbyID_settings = self.Data.getReservoirContourDataDictionary(cur_obj_settings)
             contoursbyID = WF.filterDataByYear(contoursbyID, year, extraflag='topwater')
             selectedContourIDs = WF.getUsedIDs(contoursbyID)
             straightlines = self.Data.getStraightLineValue(cur_obj_settings)
 
+            # Single-ID plots get a smaller "half page" figure;
+            # multi-ID (comparison) plots get a taller "full page" figure
+            # with one stacked panel per ID.
             if len(selectedContourIDs) == 1:
                 figsize = (12, 6)
                 pageformat = 'half'
@@ -3202,6 +3954,9 @@ class MakeAutomatedReport(object):
                 pageformat = 'full'
 
             if pageformat == 'full':
+                # Give every panel except the last one a slightly smaller
+                # height ratio, since the last panel also carries the
+                # shared x-axis tick labels.
                 height_ratios = []
                 for i in range(len(selectedContourIDs)):
                     if i == len(selectedContourIDs) - 1:
@@ -3214,11 +3969,15 @@ class MakeAutomatedReport(object):
                 fig, axes = plt.subplots(ncols=1, nrows=1, figsize=figsize,
                                          )
 
+            # ================= Inner loop: one panel per simulation ID =================
             for IDi, ID in enumerate(selectedContourIDs):
                 contour_plot_settings = pickle.loads(pickle.dumps(cur_obj_settings, -1))
                 contour_plot_settings = self.configureSettingsForID(ID, contour_plot_settings)
                 contours = WF.selectContourByID(contoursbyID, ID)
                 contours_settings = WF.selectContourByID(contoursbyID_settings, ID)
+                # Reservoir contours are only expected to have exactly
+                # one reservoir data source per ID; warn (or skip) if
+                # that assumption doesn't hold.
                 if len(contours.keys()) > 1:
                     WF.print2stdout(f'Too many reservoir keys defined. Using the first, {list(contours.keys())[0]}',
                                     debug=self.debug)
@@ -3246,6 +4005,7 @@ class MakeAutomatedReport(object):
                     if 'parameter' in contour_plot_settings.keys():
                         parameter = contour_plot_settings['parameter']
                     else:
+                        # Pick whichever parameter was used most often.
                         parameter = ''
                         top_count = 0
                         for key in contour_plot_settings['param_count'].keys():
@@ -3279,6 +4039,8 @@ class MakeAutomatedReport(object):
 
                 contour_plot_settings = WD.getDefaultContourSettings(contour_plot_settings, debug=self.debug)
 
+                # Resolve the colorbar value range, defaulting to the
+                # actual data min/max if not explicitly configured.
                 if 'min' in contour_plot_settings['colorbar']:
                     vmin = float(contour_plot_settings['colorbar']['min'])
                 else:
@@ -3288,6 +4050,9 @@ class MakeAutomatedReport(object):
                 else:
                     vmax = np.nanmax(values)
 
+                # NaN out anything above the actual water surface at
+                # each timestep, since ResSim otherwise duplicates the
+                # top-of-domain value up past the real water surface.
                 values = WF.filterContourOverTopWater(values, elevations, topwater)
 
                 contr = ax.contourf(dates, elevations, values.T, cmap=contour_plot_settings['colorbar']['colormap'],
@@ -3313,6 +4078,8 @@ class MakeAutomatedReport(object):
 
                 contour_plot_settings = WF.updateFlaggedValues(contour_plot_settings, '%%units%%', WF.formatUnitsStrings(units))
 
+                # Draw any configured overlay contour lines, each with
+                # its own optional inline label and legend entry.
                 if 'contourlines' in contour_plot_settings.keys():
                     for contourline in contour_plot_settings['contourlines']:
                         if 'value' in contourline.keys():
@@ -3344,6 +4111,8 @@ class MakeAutomatedReport(object):
                 ### Horizontal LINES ###
                 self.Plots.plotHorizontalLines(straightlines, ax, contour_plot_settings)
 
+                # For comparison reports, label each panel with which
+                # simulation it represents.
                 if self.iscomp:
                     if 'modeltext' in contour_plot_settings.keys():
                         modeltext = contour_plot_settings['modeltext']
@@ -3421,6 +4190,8 @@ class MakeAutomatedReport(object):
                 useAx.append(True)
 
             if not any(useAx):
+                # x-limits rejected every panel: skip this year's plot
+                # entirely rather than saving a blank figure.
                 print(f'Plot for {year} not included due to xlimits.')
                 plt.close("all")
                 continue
@@ -3436,6 +4207,8 @@ class MakeAutomatedReport(object):
                     if len(axes[0].get_legend_handles_labels()[0]) > 0:
                         plt.legend(fontsize=legsize)
 
+            # Shared horizontal colorbar spanning the bottom of the
+            # figure, ticked at the configured number of intervals.
             cbar = plt.colorbar(contr, ax=axes[-1], orientation='horizontal', aspect=50.)
             locs = np.linspace(vmin, vmax, int(contour_plot_settings['colorbar']['numticks']))
             cbar.set_ticks(locs)
@@ -3453,6 +4226,9 @@ class MakeAutomatedReport(object):
             plt.tight_layout()
             plt.subplots_adjust(hspace=0.05)
 
+            # Build a unique output file name (appending a numeric
+            # suffix if the base name is already taken), save the
+            # figure, then write it into the report XML.
             basefigname = os.path.join(self.images_path, 'ContourPlot' + '_' + self.ChapterRegion.replace(' ', '_')
                                        + '_' + yearstr)
             exists = True
@@ -3481,9 +4257,36 @@ class MakeAutomatedReport(object):
 
     def makeTextBox(self, object_settings):
         """
-        Makes a text box object in the report
-        :param object_settings: currently selected object settings dictionary
-        :return:
+        Write a text box element (with flag substitution) into the report.
+
+        Supports four distinct text-generation modes depending on report
+        type and settings: plain comparison text with per-ID
+        ``{section}`` repetition, model-independent comparison text with
+        per-simulation-and-model-alt repetition, non-comparison
+        model-independent text with the same per-simulation repetition,
+        and the simple default (no iteration) case.
+
+        Parameters
+        ----------
+        object_settings : dict
+            Currently selected text box object settings dictionary; must
+            contain ``'text'`` (a string or list of strings), and may
+            contain ``'iteration_sep'``, ``'exclude'``, and
+            ``'iteratesimulations'``.
+
+        Returns
+        -------
+        None
+            Writes one or more text box elements to the report XML.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.makeTextBox(object_settings)
         """
 
         objectstarttime = time.time()
@@ -3501,6 +4304,9 @@ class MakeAutomatedReport(object):
         else:
             iteration_sep = '\n'
 
+        # Programs to skip when iterating model alternatives (below), so
+        # e.g. a W2-only text block doesn't also get repeated for a
+        # ResSim alternative.
         exclude_programs = []
         if 'exclude' in object_settings.keys():
             exclude_programs = object_settings['exclude']
@@ -3514,6 +4320,10 @@ class MakeAutomatedReport(object):
 
             # If we are doing a comaprison report, the user can specify sections to be repeated for each alt by wrapping the text in {}
         if self.reportType == 'comparison' and not self.modelIndependent:
+            # Comparison report, tied to a specific model (not model
+            # independent): repeat any {section}-wrapped text once per
+            # simulation ID, appending '.<ID>' to every flag inside the
+            # section so it resolves to that specific simulation's data.
             for text in texts:
                 # object_settings['text'] = WF.parseForTextFlags(object_settings['text'])
                 text = WF.parseForTextFlags(text)
@@ -3535,6 +4345,11 @@ class MakeAutomatedReport(object):
             self.XML.writeTextBox(text)
 
         elif self.reportType == 'comparison' and self.modelIndependent and iteratesimulations is True:
+            # Model-independent comparison report with explicit
+            # simulation iteration requested: for each simulation ID,
+            # temporarily load it (and each of its model alternatives in
+            # turn, for any {section}-wrapped text) to resolve flags,
+            # then restore model-independent state afterward.
             for ID in self.SimulationVariables.keys():  # should be onle 1 simulation at this point.
                 out_text = []
                 for text in texts:
@@ -3569,6 +4384,9 @@ class MakeAutomatedReport(object):
                 self.XML.writeTextBox(text)
 
         elif self.reportType != 'comparison' and self.modelIndependent and iteratesimulations:
+            # Non-comparison report (validation/forecast), model
+            # independent, with simulation iteration requested: same
+            # per-simulation/model-alt resolution pattern as above.
             for text in texts:
                 # object_settings['text'] = WF.parseForTextFlags(object_settings['text'])
                 text = WF.parseForTextFlags(text)
@@ -3601,6 +4419,9 @@ class MakeAutomatedReport(object):
                     text = out_text
                 self.XML.writeTextBox(text)
         else:
+            # Default/simple case: no per-simulation iteration needed,
+            # just resolve flags against the currently-loaded model and
+            # write the text box(es) directly.
             for text in texts:
                 text = WF.replaceAllFlags(self, text)
                 self.XML.writeTextBox(text)
@@ -3609,9 +4430,32 @@ class MakeAutomatedReport(object):
 
     def makeTableFromFile(self, object_settings):
         """
-        Makes a table from a formatted CSV file
-        :param object_settings:
-        :return:
+        Build a table directly from one or more pre-formatted CSV files.
+
+        Unlike the statistics tables, this doesn't compute anything from
+        time series data - it reads existing formatted table file(s),
+        optionally merges multiple files on a common key, filters rows/
+        columns, and writes the result as-is.
+
+        Parameters
+        ----------
+        object_settings : dict
+            Currently selected table-from-file object settings
+            dictionary.
+
+        Returns
+        -------
+        None
+            Writes the table (or a "no data" warning) to the report XML.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.makeTableFromFile(object_settings)
         """
 
         WF.print2stdout('\n################################')
@@ -3632,6 +4476,9 @@ class MakeAutomatedReport(object):
 
         object_settings = WF.replaceflaggedValues(self, object_settings, 'fancytext', forjasper=True)
 
+        # Read every configured formatted table file, determine/format
+        # the shared primary key, merge them into one table (if more
+        # than one), and filter rows/columns per settings.
         data, data_settings = self.Data.getTableDataDictionary(object_settings, type='formatted')
         object_settings['primarykey'] = self.Data.getPrimaryTableKey(data, object_settings)
         data = self.Tables.formatPrimaryKey(data, object_settings)
@@ -3648,6 +4495,9 @@ class MakeAutomatedReport(object):
             desc = ''
 
         # ID#|value|value..etc
+        # Build one table_constructor column per non-primary-key
+        # heading, pairing each row's primary key with its value for
+        # that column.
         table_constructor = {}
         threshold_colors = np.full(len(rows), None)
         for hi, header in enumerate(headings):
@@ -3674,14 +4524,32 @@ class MakeAutomatedReport(object):
 
     def makeForecastTable(self, object_settings):
         """
-        Makes a table for forecast runs
-        Can look 1 of two ways.
-            1. If member iteration is turned on, it will be for a single forecast member.
-            member number | Operations Name | Met Name | TempTargetName
-            2. If it's off, that line will be repeated for each available member (unless specified).
-        Order of rows and contents is also variable.
-        :param object_settings:
-        :return:
+        Build a forecast ensemble metadata table (member/operations/met/target names).
+
+        Only valid for forecast reports. Can list either a single
+        forecast member's row (if member iteration is active) or every
+        available member's row, with configurable column order/content.
+
+        Parameters
+        ----------
+        object_settings : dict
+            Currently selected forecast table object settings
+            dictionary.
+
+        Returns
+        -------
+        None
+            Writes the table to the report XML, or returns early
+            (writing nothing) if the report type isn't ``'forecast'``.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.makeForecastTable(object_settings)
         """
 
         if self.reportType != 'forecast':
@@ -3721,6 +4589,10 @@ class MakeAutomatedReport(object):
             desc = ''
 
         # Get members to plot
+        # Resolve which members this table should list: an explicit
+        # user-supplied list, the single current member (or the whole
+        # section's members) during member-iteration, or every member
+        # otherwise.
         members_to_plot = []
         if 'members' in object_settings.keys():
             members_to_plot = [int(n) for n in object_settings['members']]
@@ -3746,6 +4618,9 @@ class MakeAutomatedReport(object):
         formatted_headers = self.Tables.formatForecastTableHeaders(headers)
         primarykey = headers[0]
 
+        # Build one table_constructor column per header (after the
+        # first, which becomes the primary key / row identifier), one
+        # row per member.
         table_constructor = {}
         for ci, header in enumerate(headers[1:]):  #first column will be done automatically
             rows = []
@@ -3777,12 +4652,29 @@ class MakeAutomatedReport(object):
 
     def setSimulationCSVVars(self, simulationCSV):
         """
-        Set variables pertaining to a specified simulation.
-        :param simulationCSV: dictionary of specified simulation
-        :return: class variables
-                    self.program
-                    self.modelAltName
+        Set program/model-alt-name attributes from a simulation CSV row.
 
+        Parameters
+        ----------
+        simulationCSV : dict
+            Settings dictionary for one row of the simulation CSV file
+            (see ``WAT_Reader.readReportCSVFile``).
+
+        Returns
+        -------
+        None
+            Sets ``self.programs``, ``self.reportXMLFile``, and either
+            ``self.reportXML_modelAltNames`` (deprecated format) or
+            ``self.reportXML_Keywords`` (current format).
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.setSimulationCSVVars(simulationCSV)
         """
         if simulationCSV['deprecated_method']:
             self.programs = simulationCSV['programs']
@@ -3795,19 +4687,32 @@ class MakeAutomatedReport(object):
 
     def setSimulationVariables(self, simulation):
         """
-        Sets various class variables for selected variable
-        Sets simulation dates and times
-        :param simulation: simulation dictionary object for specified simulation
-        :return: class variables
-                    self.Data.Memory
-                    self.SimulationName
-                    self.baseSimulationName
-                    self.simulationDir
-                    self.DSSFile
-                    self.StartTimeStr
-                    self.EndTimeStr
-                    self.LastComputed
-                    self.ModelAlternatives
+        Populate ``self.SimulationVariables[ID]`` from a simulation info dict.
+
+        Parameters
+        ----------
+        simulation : dict
+            Simulation settings dictionary for one simulation (see
+            ``WAT_Reader.readSimulationInfo``).
+
+        Returns
+        -------
+        None
+            Sets ``self.SimulationVariables[simulation['ID']]`` with the
+            simulation's name, directory, DSS file, start/end times,
+            last-computed timestamp, model alternatives, description,
+            analysis period, WAT alternative, and ensemble sets (if a
+            forecast report); also calls
+            ``WT.setSimulationDateTimes`` to finalize datetime objects.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.setSimulationVariables(simulation)
         """
 
         # self.Data.Memory = {}
@@ -3816,6 +4721,9 @@ class MakeAutomatedReport(object):
         self.SimulationVariables[ID]['SimulationName'] = simulation['name']
         self.SimulationVariables[ID]['baseSimulationName'] = simulation['basename']
         simulation_dir = simulation['directory']  #todo: remove when mark fixes xml output
+        # Rebuild the directory path from its non-empty components, to
+        # normalize away any duplicate/stray path separators from the
+        # WAT-produced XML.
         simulation_dir_split = simulation_dir.split(os.path.sep)
         simulation_list = [s for s in simulation_dir_split if s != '']
         simulation_dir = os.path.sep.join(simulation_list)
@@ -3838,10 +4746,30 @@ class MakeAutomatedReport(object):
 
     def organizeMembers(self):
         """
-        Formats members part of an ensemble set and gets a list of all members
-        :return:
+        Build the sorted list of every forecast member across all simulations.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        None
+            Sets ``self.allMembers`` (sorted list of member numbers) and
+            updates each simulation's ``'ensemblesets'`` in place with
+            formatted (collection-offset-applied) member numbers.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.organizeMembers()
         """
 
+        # accumulate every member number across every simulation's ensemble sets
         self.allMembers = []
         for simulation in self.Simulations:
             simulation['ensemblesets'] = self.formatMembers(simulation['ensemblesets'])
@@ -3852,13 +4780,35 @@ class MakeAutomatedReport(object):
 
     def formatMembers(self, ensemblesets):
         """
-        Formats members as part of a collection set. Takes the collection start and adds to the member number
-        ex: member 4, collection start 5000, return 5004
-        :param ensemblesets: dictionary for ensemble sets
-        :return: formatted ensemble set dictionaries
+        Apply each ensemble set's collection offset to its member numbers.
+
+        Example: member 4 with a collection start of 5000 becomes 5004.
+
+        Parameters
+        ----------
+        ensemblesets : list of dict
+            List of ensemble set settings dictionaries, each with
+            ``'memberstoreport'`` (comma-separated string) and
+            ``'collectionsstart'``.
+
+        Returns
+        -------
+        list of dict
+            The ensemble sets, each updated with a ``'members'`` key
+            holding the offset-applied member number list.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.formatMembers(ensemblesets)
         """
 
         formatted_ensemblesets = []
+        # apply the collection offset to every member in every ensemble set
         for ensembleset in ensemblesets:
             members = ensembleset['memberstoreport']
             collectionstart = int(ensembleset['collectionsstart'])
@@ -3872,30 +4822,78 @@ class MakeAutomatedReport(object):
 
     def getLineSettings(self, LineSettings, Flag):
         """
-        Gets the correct line settings for the selected flag
-        :param LineSettings: dictionary of settings
-        :param Flag: selected flag to match line
-        :return: deep copy of line
+        Find and deep-copy the settings for a specific line flag.
+
+        Parameters
+        ----------
+        LineSettings : list of dict
+            List of line settings dictionaries, each with a ``'flag'``
+            key.
+        Flag : str
+            The flag to search for.
+
+        Returns
+        -------
+        dict or None
+            A deep copy of the matching line's settings, or ``None`` if
+            no match was found.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.getLineSettings(LineSettings, 'Observed')
         """
 
+        # scan for a matching flag, returning a deep copy so the caller can't mutate the original
         for line in LineSettings:
             if Flag == line['flag']:
                 return pickle.loads(pickle.dumps(line, -1))
 
     def getPlotLabelMasks(self, idx, nprofiles, cols):
         """
-        Gets plot label masks
-        :param idx: page index
-        :param nprofiles: number of profiles
-        :param cols: number of columns
-        :return: boolean fields for plotting
+        Determine whether a profile-plot panel should show axis labels.
+
+        A panel shows the x-label if it's in the bottom row, and the
+        y-label if it's in the leftmost column.
+
+        Parameters
+        ----------
+        idx : int
+            Panel index (0-based) within the current page.
+        nprofiles : int
+            Total number of profile panels on the current page.
+        cols : int
+            Number of columns in the panel grid.
+
+        Returns
+        -------
+        add_xlabel : bool
+            Whether this panel is in the bottom row.
+        add_ylabel : bool
+            Whether this panel is in the leftmost column.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.getPlotLabelMasks(3, 6, 3)
+        (True, False)
         """
 
         if idx >= nprofiles - cols:
+            # this panel is in the bottom row of the grid
             add_xlabel = True
         else:
             add_xlabel = False
         if idx % cols == 0:
+            # this panel is in the leftmost column of the grid
             add_ylabel = True
         else:
             add_ylabel = False
@@ -3904,15 +4902,41 @@ class MakeAutomatedReport(object):
 
     def getPlotParameter(self, object_settings):
         """
-        Gets the plot parameters based on user settings. If explicitly stated, uses that. Otherwise, looks at the
-        defined parameters in the linedata and grabs the most common one.
-        :param object_settings: currently selected object settings dictionary
-        :return: plot parameter if possible, otherwise None
+        Determine a plot object's overall parameter name.
+
+        If explicitly configured, uses that; otherwise looks at every
+        line's ``'parameter'`` setting and uses it only if all lines
+        agree on a single parameter.
+
+        Parameters
+        ----------
+        object_settings : dict
+            Currently selected object settings dictionary; must contain
+            a ``'lines'`` list if ``'parameter'`` isn't set directly.
+
+        Returns
+        -------
+        str or None
+            The plot's parameter name, or ``None`` if it couldn't be
+            determined (no explicit setting and lines disagree/are
+            unset).
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.getPlotParameter(object_settings)
+        'temperature'
         """
 
         if 'parameter' in object_settings.keys():
+            # explicit parameter given, use it directly
             plot_parameter = object_settings['parameter']
         else:
+            # collect every line's own parameter, and only use it if they all agree
             params = []
             for line in object_settings['lines']:
                 if 'parameter' in line.keys():
@@ -3925,10 +4949,31 @@ class MakeAutomatedReport(object):
 
     def writeXMLIntroduction(self):
         """
-        Writes the intro section for XML file. Creates a line in the intro for each model used
+        Write the report's introduction section, with one line per model used.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        None
+            Writes the intro block to the report XML; each model's
+            actual intro text is placeholder-substituted later via
+            ``appendXMLModelIntroduction``/``fixXMLModelIntroduction``.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.writeXMLIntroduction()
         """
 
         self.XML.writeIntroStart()
+        # write one placeholder intro line per chapter/model, to be filled in later
         for model in self.reportCSV.keys():
             # program = self.XML.writeIntroLine(self.reportCSV[model]['program'])
             self.XML.writeIntroLine('%%REPLACEINTRO_{0}%%'.format(model))
@@ -3936,16 +4981,32 @@ class MakeAutomatedReport(object):
 
     def writeChapter(self):
         """
+        Write every chapter defined in the current simulation's chapter definition file.
 
-        Writes each chapter defined in the simulation CSV file to the XML file during initialization.
+        For each chapter: applies its debug/resolution/member-iteration/
+        group-members settings (which cascade through the rest of report
+        generation as ``self.debug``/``self.highres``/
+        ``self.memberiteration``/``self.groupmembers``), then delegates
+        to ``writeSections`` (which in turn calls ``iterateSection`` to
+        actually build the chapter's plots/tables/text boxes).
 
-        This function:
-        - Iterates through ChapterDefinitions(), extracting and setting chapter-specific attributes.
-        - Calls writeSections() to process the sections of the chapter,
-          which in turn calls iterateSections() to generate plots and figures.
+        Parameters
+        ----------
+        None
 
-        :return: Updates class variables
+        Returns
+        -------
+        None
+            Writes each chapter's XML content to the report.
 
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.writeChapter()
         """
 
         for Chapter in self.ChapterDefinitions:
@@ -3959,6 +5020,7 @@ class MakeAutomatedReport(object):
 
             self.debug = False
             if self.debug_boolean.lower() == 'true':
+                # verbose logging requested for this chapter
                 self.debug = True
                 WF.print2stdout('Verbose mode activated!')
             else:
@@ -3969,11 +5031,13 @@ class MakeAutomatedReport(object):
                 self.highres = True
                 WF.print2stdout('Running High Res Mode!')
             elif self.ChapterResolution.lower() == 'low':
+                # explicit low-res requested, overrides the default
                 self.highres = False
                 WF.print2stdout('Running Low Res Mode!')
 
             self.memberiteration = False
             if self.memberiteration_boolean.lower() == 'true':
+                # this chapter should be built once per forecast member
                 self.memberiteration = True
                 WF.print2stdout('member iteration mode activated!')
             else:
@@ -3981,6 +5045,7 @@ class MakeAutomatedReport(object):
 
             self.groupmembers = False
             if self.groupmembers_boolean.lower() == 'true':
+                # identical-data members should be grouped/combined rather than repeated
                 self.groupmembers = True
                 WF.print2stdout('group member mode activated!')
             else:
@@ -3999,11 +5064,33 @@ class MakeAutomatedReport(object):
 
     def writeSections(self, Chapter):
         """
-        Processes sections for a chapter. If `self.memberiteration` is True, it loops
-        through ensembles and members, handling a second pass for non-identical members.
-        Otherwise, processes sections directly.
+        Write every section of a chapter, handling forecast member iteration.
 
-        :param Chapter: Dictionary with section details from the XML file.
+        If ``self.memberiteration`` is enabled, loops through every
+        ensemble/member combination, resolving each section's header
+        text for that member (including grouping duplicate-data members
+        into a single combined section when ``self.groupmembers`` is
+        set). Otherwise, writes each section once directly.
+
+        Parameters
+        ----------
+        Chapter : dict
+            Chapter definition dictionary (from the chapter definitions
+            XML), containing a ``'sections'`` list.
+
+        Returns
+        -------
+        None
+            Writes each section's header and content to the report XML.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.writeSections(Chapter)
         """
 
         for section in Chapter['sections']:
@@ -4012,10 +5099,17 @@ class MakeAutomatedReport(object):
             section_header = WF.replaceFlaggedValue(self, section_header, 'fancytext', forjasper=True)
             self.multiMemberSection = False
             if self.memberiteration:
+                # ===================== Forecast member iteration =====================
                 for ensemble in self.ensemblesets:
                     for member in ensemble['members']:
                         self.member = int(member)
                         if self.groupmembers:
+                            # Determine whether this section's objects
+                            # produce identical output across multiple
+                            # members (checked/cached via
+                            # preCheckSectionForDuplicates); if so, the
+                            # section is written once combining all of
+                            # them rather than once per member.
                             self.membersInSection, section = self.preCheckSectionForDuplicates(section) #check for section being multi-member
                             if len(self.membersInSection) > 0:
                                 self.multiMemberSection = True
@@ -4023,6 +5117,9 @@ class MakeAutomatedReport(object):
                                 self.multiMemberSection = False
 
                             if self.multiMemberSection:
+                                # Skip this member's section entirely if
+                                # its group was already written out under
+                                # an earlier member in the group.
                                 member_already_used = self.checkForMemberUsed(member, self.membersInSection)
                                 if member_already_used:
                                     WF.print2stdout(f'Member {member} already used in previous section. Skipping.')
@@ -4063,6 +5160,8 @@ class MakeAutomatedReport(object):
                                 self.XML.writeSectionHeaderEnd()
 
                         else:
+                            # Not grouping members: write this member's
+                            # section fresh every time.
                             # this will cover anything in 'general' or 'modelspecific' which includes SimulationName
                             new_section_header = WF.replaceflaggedValues(self, section_header, 'modelspecific')
                             new_section_header = WF.replaceflaggedValues(self, new_section_header, 'general')
@@ -4079,27 +5178,83 @@ class MakeAutomatedReport(object):
                             self.XML.writeSectionHeaderEnd()
 
             else:
+                # No member iteration: write the section exactly once.
                 self.XML.writeSectionHeader(section_header)
                 self.iterateSection(section)
                 self.XML.writeSectionHeaderEnd()
 
     def iterateSection(self, section):
         """
-        Iterates through objects in a section to build tables and plots
-        :param section: dictionary read from XML file
+        Build every plot/table/text object within a section.
+
+        Parameters
+        ----------
+        section : dict
+            Section dictionary (from the chapter definitions XML),
+            containing an ``'objects'`` list.
+
+        Returns
+        -------
+        None
+            Calls ``makeObject`` for each object, which writes it to the
+            report XML.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.iterateSection(section)
         """
 
+        # build every configured object in this section, one at a time
         for object in section['objects']:
             objtype = object['type'].lower()
             self.makeObject(object, objtype)
 
     def iterateMultiMemberSection(self, section):
+        """
+        Build every object in a section that combines multiple forecast members.
+
+        Objects flagged ``'isduplicate'`` are built once (their data is
+        identical across the grouped members); other objects are built
+        once per member in ``self.membersInSection`` (e.g. a table
+        listing per-member details that a plot's grouping doesn't
+        apply to).
+
+        Parameters
+        ----------
+        section : dict
+            Section dictionary containing an ``'objects'`` list, each
+            expected to have an ``'isduplicate'`` flag.
+
+        Returns
+        -------
+        None
+            Calls ``makeObject`` for each object (possibly multiple
+            times, once per member), which writes it to the report XML.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.iterateMultiMemberSection(section)
+        """
         for object in section['objects']:
             objtype = object['type'].lower()
             if 'isduplicate' in object.keys():
                 if object['isduplicate']:
+                    # data is identical across the grouped members, build it just once
                     self.makeObject(object, objtype)
                 else:
+                    # Not a duplicate across members: build the object
+                    # once per member in the group, temporarily swapping
+                    # self.member for each.
                     original_member = self.member
                     for target_member in self.membersInSection:
                         self.member = target_member
@@ -4113,6 +5268,34 @@ class MakeAutomatedReport(object):
 
 
     def makeObject(self, object, objtype):
+        """
+        Dispatch a single report object to the method that builds it.
+
+        Parameters
+        ----------
+        object : dict
+            Settings dictionary for the object to build.
+        objtype : str
+            Lowercased object type name (e.g. ``'timeseriesplot'``,
+            ``'errorstatisticstable'``), used to select which
+            ``make*`` method to call.
+
+        Returns
+        -------
+        None
+            Calls the matching ``make*`` method, which writes the
+            object to the report XML. Unrecognized types are skipped
+            with a log message.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.makeObject(object, 'timeseriesplot')
+        """
         if objtype == 'timeseriesplot':
             self.makeTimeSeriesPlot(object)
         elif objtype == 'profileplot':
@@ -4138,6 +5321,7 @@ class MakeAutomatedReport(object):
         elif objtype == 'forecasttable':
             self.makeForecastTable(object)
         else:
+            # unrecognized object type, skip it entirely with a warning
             WF.print2stdout('Section Type {0} not identified.'.format(objtype))
             WF.print2stdout('Skipping Section..')
 
@@ -4145,28 +5329,83 @@ class MakeAutomatedReport(object):
 
     def cleanOutputDirs(self):
         """
-        Cleans the images output directory, so png's from old reports aren't mistakenly added to new reports.
-        Creates directory if it doesn't exist.
+        Clear old PNG/CSV files from the output directories before a new run.
+
+        Creates the images/CSV output directories if they don't already
+        exist.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        None
+            Deletes every ``.png`` and ``.csv`` file from
+            ``self.images_path``, and every ``.csv`` file from
+            ``self.CSVPath``.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.cleanOutputDirs()
         """
 
+        # ensure both output directories exist before attempting to clean them
         if not os.path.exists(self.images_path):
             os.makedirs(self.images_path)
         if not os.path.exists(self.CSVPath):
             os.makedirs(self.CSVPath)
 
+        # remove stale output files from prior runs
         WF.cleanOutputDirectory(self.images_path, '.png')
         WF.cleanOutputDirectory(self.images_path, '.csv')
         WF.cleanOutputDirectory(self.CSVPath, '.csv')
 
     def loadModelAlts(self, csvChapterSettings):
         """
-        Loads info for specified model alts.
-        Loads correct model program class from WDR
-        :param csvChapterSettings: simulation alt dict object from self.simulation.
-        :return: class variables
-                self.alternativeFpart
-                self.alternativeDirectory
-                self.ModelAlt - WDR class that is program specific
+        Select and load the correct model alternative for every simulation.
+
+        For each simulation, filters its model alternatives down to
+        those matching the chapter CSV row's requested program(s) (and,
+        for the deprecated CSV format, requested model-alt name(s)),
+        then further narrows by keyword and usage-order if multiple
+        candidates remain. Instantiates the appropriate program-specific
+        results class (``WAT_ResSim_Results`` or ``WAT_W2_Results``) for
+        each accepted simulation.
+
+        Parameters
+        ----------
+        csvChapterSettings : dict
+            One row of the simulation CSV file (chapter definition
+            selection settings), containing ``'programs'`` and either
+            ``'modelaltnames'`` (deprecated format) or ``'keywords'``/
+            ``'numtimesprogramused'`` (current format).
+
+        Returns
+        -------
+        None
+            Sets ``self.accepted_IDs``, ``self.modelIndependent``, and
+            (per accepted simulation ID) ``alternativeFpart``,
+            ``alternativeDirectory``, ``modelAltName``, ``program``,
+            ``modelAltDesc``, and ``ModelAlt`` within
+            ``self.SimulationVariables``. Exits the script if no
+            simulation IDs end up accepted for a model-dependent
+            chapter.
+
+        Raises
+        ------
+        SystemExit
+            Raised (via ``sys.exit(1)``) if no simulation IDs end up
+            accepted for a chapter that isn't model independent.
+
+        Examples
+        --------
+        >>> report.loadModelAlts(csvChapterSettings)
         """
 
         self.accepted_IDs = []  #IDs are tied to Model Alts in Simulations
@@ -4182,8 +5421,11 @@ class MakeAutomatedReport(object):
             csv_programs = [n.lower() for n in csvChapterSettings['programs']]
             if csvChapterSettings['deprecated_method']:  #new method does not care about this
                 csv_modelaltnames = [n.lower() for n in csvChapterSettings['modelaltnames']]
+            # ===================== Per-simulation model-alt selection =====================
             for ID in self.SimulationVariables.keys():  #for each simulation
                 if csvChapterSettings['deprecated_method']:  #TODO: remove this far enough into the future
+                    # Deprecated format: match on both program AND model
+                    # alt name explicitly listed in the CSV.
                     approved_modelalts = [modelalt for modelalt in self.SimulationVariables[ID]['ModelAlternatives']
                                           if modelalt['name'].lower() in csv_modelaltnames and
                                           modelalt['program'].lower() in csv_programs]
@@ -4195,6 +5437,9 @@ class MakeAutomatedReport(object):
 
 
                 else:
+                    # Current format: match on program only, then narrow
+                    # down further by keyword and usage-order if there's
+                    # more than one candidate.
                     # First, for each simulation, figure out which model alts per sim work
                     approved_modelalts = [modelalt for modelalt in self.SimulationVariables[ID]['ModelAlternatives']
                                           if modelalt['program'].lower() in csvChapterSettings['programs']]
@@ -4214,6 +5459,11 @@ class MakeAutomatedReport(object):
                             approved_modelalts = keyword_approved_modelalts
 
                     if len(approved_modelalts) > 1:  #try and filter by order now
+                        # Still ambiguous: pick the Nth candidate matching
+                        # how many times this program has already been
+                        # used earlier in the CSV (so repeated CSV rows
+                        # for the same program cycle through the
+                        # available model alts in order).
                         try:
                             approved_modelalts = [approved_modelalts[csvChapterSettings['numtimesprogramused']-1]] #starts at 1
                         except IndexError:
@@ -4232,6 +5482,9 @@ class MakeAutomatedReport(object):
                 self.SimulationVariables[ID]['program'] = approved_modelalt['program']
                 self.SimulationVariables[ID]['modelAltDesc'] = approved_modelalt['description']
 
+                # Instantiate the program-specific results reader for
+                # this simulation, used by the data organizer to
+                # actually pull time series/profile data.
                 if self.SimulationVariables[ID]['program'].lower() == "ressim":
                     self.SimulationVariables[ID]['ModelAlt'] = WRSS.ResSim_Results(
                         self.SimulationVariables[ID]['simulationDir'],
@@ -4251,6 +5504,9 @@ class MakeAutomatedReport(object):
 
             if not self.modelIndependent:
                 if len(self.accepted_IDs) == 0: #if we accept no IDs
+                    # No simulation matched this chapter's requested
+                    # program(s): this is a fatal configuration error, so
+                    # log helpful diagnostic info and exit.
                     WF.print2stderr('Incompatible input information from the WAT XML output file ({0}))'.format(self.simulationInfoFile))
                     WF.print2stderr('Please confirm inputs and run again.')
                     WF.print2stdout('CSV Programs: {0}'.format(csvChapterSettings['programs']))
@@ -4266,10 +5522,36 @@ class MakeAutomatedReport(object):
 
     def loadCurrentID(self, ID):
         """
-        Loads model specific settings for a given ID
-        :param ID: selected ID, such as 'base' or 'alt_1'
+        Load simulation-level (not model-alternative-level) settings for a given ID.
+
+        Parameters
+        ----------
+        ID : str
+            Selected simulation ID, such as ``'base'`` or ``'alt_1'``.
+
+        Returns
+        -------
+        None
+            Sets ``self.currentlyloadedID`` and a series of
+            simulation-level attributes (``SimulationName``,
+            ``baseSimulationName``, ``SimulationDir``, ``DSSFile``,
+            ``StartTimeStr``/``EndTimeStr``, ``LastComputed``,
+            ``ModelAlternatives``, ``StartTime``/``EndTime``,
+            ``ensemblesets``, ``SimulationDescription``, and
+            optionally ``AnalysisPeriod``/``WatAlternative``) from
+            ``self.SimulationVariables[ID]``.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.loadCurrentID('base')
         """
 
+        # switch the active simulation ID and pull every relevant setting from it
         self.currentlyloadedID = ID
         self.SimulationName = self.SimulationVariables[ID]['SimulationName']
         self.baseSimulationName = self.SimulationVariables[ID]['baseSimulationName']
@@ -4284,11 +5566,44 @@ class MakeAutomatedReport(object):
         self.ensemblesets = self.SimulationVariables[ID]['ensemblesets']
         self.SimulationDescription = self.SimulationVariables[ID]['Description']
         if 'AnalysisPeriod' in self.SimulationVariables[ID].keys():
+            # optional field, only set if it was defined for this simulation
             self.AnalysisPeriod = self.SimulationVariables[ID]['AnalysisPeriod']
         if 'WatAlternative' in self.SimulationVariables[ID].keys():
+            # optional field, only set if it was defined for this simulation
             self.WatAlternative = self.SimulationVariables[ID]['WatAlternative']
 
     def softLoadModelAlt(self, modelalt):
+        """
+        Temporarily set model-alternative attributes from a raw model-alt dict.
+
+        Unlike ``loadCurrentModelAltID``, this loads directly from a
+        ``modelalt`` settings dict rather than from
+        ``self.SimulationVariables[ID]``; used when iterating model
+        alternatives for text-flag resolution (e.g. in ``makeTextBox``)
+        without a full model alt data load.
+
+        Parameters
+        ----------
+        modelalt : dict
+            Model alternative settings dictionary with ``'fpart'``,
+            ``'name'``, ``'description'``, and ``'program'`` keys.
+
+        Returns
+        -------
+        None
+            Sets ``self.alternativeFpart``, ``self.modelAltName``,
+            ``self.ModelAlt``, ``self.ModelAltDescription``, and
+            ``self.program``.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.softLoadModelAlt(modelalt)
+        """
         self.alternativeFpart = modelalt['fpart']
         self.modelAltName = modelalt['name']
         self.ModelAlt = modelalt
@@ -4297,11 +5612,35 @@ class MakeAutomatedReport(object):
 
     def loadCurrentModelAltID(self, ID):
         """
-        Loads model alternative specific settings for a given ID
-        :param ID: selected ID, such as 'base' or 'alt_1'
+        Load model-alternative-level settings for a given simulation ID.
+
+        Parameters
+        ----------
+        ID : str
+            Selected simulation ID, such as ``'base'`` or ``'alt_1'``.
+
+        Returns
+        -------
+        None
+            If not model-independent, sets ``self.alternativeFpart``,
+            ``self.alternativeDirectory``, ``self.modelAltName``,
+            ``self.program``, ``self.ModelAlt``,
+            ``self.ensembleSets``, and ``self.ModelAltDescription``
+            from ``self.SimulationVariables[ID]``. If model-independent,
+            sets placeholder ``'none'`` values instead.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.loadCurrentModelAltID('base')
         """
 
         if not self.modelIndependent:
+            # normal case, pull the model-alt-specific settings for this ID
             self.alternativeFpart = self.SimulationVariables[ID]['alternativeFpart']
             self.alternativeDirectory = self.SimulationVariables[ID]['alternativeDirectory']
             self.modelAltName = self.SimulationVariables[ID]['modelAltName']
@@ -4312,6 +5651,7 @@ class MakeAutomatedReport(object):
 
             # WF.print2stdout('Model {0} Loaded'.format(ID), debug=self.debug) #noisy
         else:
+            # model-independent chapter, no real model alt to load, use placeholders
             self.alternativeFpart = 'none'
             self.alternativeDirectory = 'none'
             self.modelAltName = 'none'
@@ -4321,9 +5661,27 @@ class MakeAutomatedReport(object):
 
     def initializeXML(self):
         """
-        Creates a new version of the template XML file, initiates the XML class, and writes the cover page
-        :return: sets class variables
-                    self.XML
+        Create a fresh report XML file and write its cover page.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        None
+            Sets ``self.XML`` (a ``WAT_XML_Utils.XMLReport`` instance)
+            and writes the cover page title appropriate to
+            ``self.reportType``.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.initializeXML()
         """
 
         # new_xml = os.path.join(self.studyDir, 'reports', 'Datasources', 'USBRAutomatedReportOutput.xml') #required name for file
@@ -4340,41 +5698,123 @@ class MakeAutomatedReport(object):
 
     def initializeDataOrganizer(self):
         """
-        Creates Data_Memory dictionary
+        Instantiate the data organizer for this report run.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        None
+            Sets ``self.Data`` (a ``WAT_DataOrganizer.DataOrganizer``
+            instance), which also initializes its empty memory cache.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.initializeDataOrganizer()
         """
 
         self.Data = WDO.DataOrganizer(self)
 
     def initSimulationDict(self):
         """
-        Creates simulationVariables dictionary
+        Reset the simulation variables dictionary.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        None
+            Sets ``self.SimulationVariables`` to an empty dict.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.initSimulationDict()
         """
 
         self.SimulationVariables = {}
 
     def loadDefaultPlotObject(self, plotobject):
         """
-        Loads the graphic default options.
-        :param plotobject: string specifying the default graphics object
-        :return:
-            plot_info: dict of object settings
+        Look up an object type's default settings from the graphics defaults file.
+
+        Parameters
+        ----------
+        plotobject : str
+            Name of the default graphics object type (e.g.
+            ``'timeseriesplot'``), matching a key in
+            ``self.graphicsDefault``.
+
+        Returns
+        -------
+        dict
+            A deep copy of the object's default settings, or an empty
+            dict (with a logged message) if not found.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.loadDefaultPlotObject('timeseriesplot')
         """
 
         if plotobject in self.graphicsDefault.keys():
+            # deep-copy so callers can safely mutate their own copy of the defaults
             plot_info = pickle.loads(pickle.dumps(self.graphicsDefault[plotobject], -1))
         else:
+            # no defaults defined for this object type at all
             WF.print2stdout(f'Plotting object {plotobject} not found in graphics default file.', debug=self.debug)
             plot_info = {}
         return plot_info
 
     def getLineModelType(self, Line_info):
         """
-        Attempts to figure out which model the data is for based off the model source as an attempt to filter out data
-        retrieval attempts
-        :param Line_info: dictionary of settings for line
-        :return: model program name if possible
+        Infer which model program a line's data source belongs to.
+
+        Checks the line's settings for any of the model-specific
+        indicator keys defined in ``self.Constants.model_specific_vars``
+        (e.g. ``'ressimresname'`` implies ResSim, ``'w2_file'`` implies
+        CE-QUAL-W2).
+
+        Parameters
+        ----------
+        Line_info : dict
+            Settings dictionary for a single line.
+
+        Returns
+        -------
+        str
+            The inferred program name, or ``'undefined'`` if no
+            model-specific indicator key was found.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.getLineModelType({'w2_file': 'spr.opt'})
+        'cequalw2'
         """
 
+        # check each known model-specific indicator key in turn
         for var, ident in self.Constants.model_specific_vars.items():
             if var in Line_info.keys():
                 return ident
@@ -4383,13 +5823,37 @@ class MakeAutomatedReport(object):
 
     def appendXMLModelIntroduction(self, simorder):
         """
-        Fixes intro in XML that shows which models are used for each region.
-        Updates a flag with used models.
-        :param simorder: number of simulation file
-        :return:
+        Insert per-chapter model-usage lines into the report introduction.
+
+        For each chapter, builds a line listing which program(s) were
+        used for that chapter's accepted simulation IDs, and inserts it
+        after the placeholder ``%%REPLACEINTRO_<simorder>%%`` marker
+        written earlier by ``writeXMLIntroduction``.
+
+        Parameters
+        ----------
+        simorder : int or str
+            The chapter-key/order number this call corresponds to
+            (matches the placeholder inserted for this chapter).
+
+        Returns
+        -------
+        None
+            Inserts XML lines into the report; does nothing if
+            ``self.modelIndependent`` is ``True``.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.appendXMLModelIntroduction(1)
         """
 
         if not self.modelIndependent:
+            # build one intro line per chapter, listing its accepted IDs' programs
             modelstrs = []
             for Chapter in self.ChapterDefinitions:
                 chapname = Chapter['name']
@@ -4401,6 +5865,9 @@ class MakeAutomatedReport(object):
                 outstr += '</Model>\n'
                 modelstrs.append(outstr)
 
+            # Insert each chapter's line right after the previous one, so
+            # they end up in the same order as ChapterDefinitions; each
+            # gets a unique modelOrder number for XML ordering purposes.
             lastline = '%%REPLACEINTRO_{0}%%'.format(simorder)
             for i, ms in enumerate(modelstrs):
                 tmpstr = ms.replace('%%modelOrder%%', str(self.modelOrder))
@@ -4410,48 +5877,139 @@ class MakeAutomatedReport(object):
 
     def fixXMLModelIntroduction(self):
         """
-        Removes extra flag values from the report introduction
+        Remove any leftover ``%%REPLACEINTRO_`` placeholder lines from the report.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        None
+            Cleans up the report XML in place.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.fixXMLModelIntroduction()
         """
 
         self.XML.removeLine('%%REPLACEINTRO_')
 
     def checkModelType(self, line_info):
         """
-         Checks to see if current data path configuration is congruent with currently loaded model ID.
-        :param line_info: selected line or datapath
-        :return: boolean
+        Check whether a line's data source matches the currently-loaded model program.
+
+        Parameters
+        ----------
+        line_info : dict
+            Settings dictionary for a single line or datapath.
+
+        Returns
+        -------
+        bool
+            ``True`` if the line's inferred model type is undefined
+            (i.e. not tied to any specific program) or matches
+            ``self.program``; ``False`` if it's tied to a different
+            program than the one currently loaded.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.checkModelType({'w2_file': 'spr.opt'})
+        True
         """
 
         modeltype = self.getLineModelType(line_info)
         if modeltype == 'undefined':
+            # not tied to any specific program, always considered compatible
             return True
         if modeltype.lower() != self.program.lower():
+            # tied to a different program than the one currently loaded
             return False
         return True
 
     def configureSettingsForID(self, ID, settings):
         """
-        Loads settings for selected run ID. Mainly for comparison plots.
-        Then replaces model specific flags in settings using loaded variables
-        :param ID: selected ID, aka 'base' or 'alt_1'
-        :param settings: dictionary of settings possibly containing flags to replace
-        :return: settings with updated flags. also flags such as self.baseSimulationName are updated to current ID
+        Switch the currently-loaded simulation/model-alt to ``ID`` and resolve flags.
+
+        Mainly used for comparison plots, where settings need to be
+        resolved against a specific simulation ID other than the one
+        currently active.
+
+        Parameters
+        ----------
+        ID : str
+            Selected simulation ID, e.g. ``'base'`` or ``'alt_1'``.
+        settings : dict
+            Settings dictionary potentially containing
+            ``'modelspecific'`` flags to resolve.
+
+        Returns
+        -------
+        dict
+            The ``settings`` dictionary with model-specific flags
+            resolved against the now-current ID.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.configureSettingsForID('alt_1', settings)
         """
 
+        # switch both the simulation-level and model-alt-level active state to the requested ID
         self.loadCurrentID(ID)
         self.loadCurrentModelAltID(ID)
         settings = WF.replaceflaggedValues(self, settings, 'modelspecific')
         return settings
 
     def preCheckSectionForDuplicates(self, section):
-        '''
-        Check if any objects in the section are duplicates. If so, mark them as such and return a list of all members
-        list of members then goes to create a group section for those members
-        :param section: dict with info about each report section
-        :return:
-        list of duplicate members
-        new section with flag confirming if duplicate or not
-        '''
+        """
+        Scan a section's objects for forecast members with identical data.
+
+        For every plot-like object in the section (one with ``'lines'``
+        or ``'datapaths'``), checks whether the current member's data is
+        fully duplicated by other members, and if so, marks the object
+        as a duplicate and collects the full set of members sharing that
+        duplicate data. The resulting member list is used by
+        ``writeSections`` to decide whether the section should be
+        combined into a single multi-member write.
+
+        Parameters
+        ----------
+        section : dict
+            Section dictionary containing an ``'objects'`` list.
+
+        Returns
+        -------
+        duplicate_members : list
+            Combined list of every member found to share duplicate data
+            with the current member, across all objects in the section.
+        section : dict
+            The section dictionary, with each checked object's
+            ``'isduplicate'`` flag set.
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> duplicate_members, section = report.preCheckSectionForDuplicates(section)
+        """
 
         duplicate_members = []
         objects_formated = []
@@ -4462,6 +6020,7 @@ class MakeAutomatedReport(object):
                 if self.Data.checkForDuplicateObject(line_settings, self.member): #check if anything is fully duplicate
                     # islowest = self.Data.checkForLowestMember(line_settings, self.member)
                     # if islowest: #if not lowest, then we probably already did this
+                    # combine every member sharing this duplicate data into the running list
                     for member in [self.member] + self.Data.getOtherMembers(line_settings, self.member):
                         if member not in duplicate_members:
                             duplicate_members.append(member)
@@ -4470,27 +6029,49 @@ class MakeAutomatedReport(object):
                     object['isduplicate'] = False
                 objects_formated.append(object)
             else:
+                # Non-plot objects (e.g. text boxes) aren't checked for
+                # duplication; pass through unchanged.
                 objects_formated.append(object)
         section['object'] = objects_formated
         return duplicate_members, section
 
     def checkForMemberUsed(self, member, membersInSection):
-        '''
-        checks if the current member is the smallest in the batch. We generally only plot on the first member, if we are
-        doing member iterations and grouping them
-        :param member: current member
-        :param membersInSection: all members in section
-        :return: boolean
-        '''
+        """
+        Check whether a member should be skipped as already covered by an earlier member.
+
+        When grouping identical members in a section, only the lowest
+        (first) member in the group is actually processed; every other
+        member in the group is skipped since the lowest member's output
+        already covers them.
+
+        Parameters
+        ----------
+        member : int
+            The current member being considered.
+        membersInSection : list
+            All members grouped together for this section.
+
+        Returns
+        -------
+        bool
+            ``True`` if ``member`` is not the lowest in the group (i.e.
+            should be skipped), ``False`` if it is the lowest (i.e.
+            should be processed).
+
+        Raises
+        ------
+        None
+            This function does not explicitly raise exceptions.
+
+        Examples
+        --------
+        >>> report.checkForMemberUsed(5, [3, 5, 7])
+        True
+        """
 
         if member != min(membersInSection): #we do everything on the first grouped member, so skip if were not them
             return True
         return False
-
-
-
-
-
 
 
 if __name__ == '__main__':
@@ -4499,6 +6080,9 @@ if __name__ == '__main__':
         WF.print2stdout(VERSIONNUMBER)
         sys.exit(0)
     else:
+        # sys.argv[0] is conventionally the script path, not a real
+        # argument, but is used here as 'rundir' (the batch/install
+        # directory) per this script's calling convention.
         rundir = sys.argv[0]
         simInfoFile = sys.argv[1]
 
@@ -4508,5 +6092,7 @@ if __name__ == '__main__':
         try:
             MakeAutomatedReport(simInfoFile, rundir)
         except:
+            # Catch-all: log the full traceback and exit non-zero so the
+            # calling WAT process can detect report generation failure.
             WF.print2stderr(traceback.format_exc())
             sys.exit(1)
