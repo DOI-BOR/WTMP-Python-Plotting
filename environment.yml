@@ -27,6 +27,7 @@ dependencies:
   - python-dateutil
   - pytz
   - pywin32
+  - rasterio
   - scikit-learn
   - scipy
   - six
@@ -42,7 +43,7 @@ dependencies:
       - pefile
       - pytzdata
       - pywin32-ctypes
-      - pydsstools
+      - pydsstools==2.4
       - zope-interface
       
 
